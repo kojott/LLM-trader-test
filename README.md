@@ -108,6 +108,58 @@ Then open <http://localhost:8501> to access the UI.
 
 The top-level metrics include Sharpe and Sortino ratios alongside balance, equity, and PnL so you can quickly assess both realised returns and downside-adjusted performance.
 
+## Running Locally (Without Docker)
+
+While Docker is recommended for a consistent environment, you can also run the bot and dashboard directly on your local machine.
+
+### 1. Setup a Virtual Environment
+
+It's best practice to use a virtual environment to manage dependencies.
+
+```bash
+# Create a virtual environment
+python3 -m venv venv
+
+# Activate it (on macOS/Linux)
+source venv/bin/activate
+
+# Or on Windows
+# venv\Scripts\activate
+```
+
+### 2. Install Dependencies
+
+Install the required Python packages using pip.
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Configure Environment Variables
+
+Copy the example `.env` file and add your API keys.
+
+```bash
+cp .env.example .env
+```
+Now edit the `.env` file to add your credentials.
+
+### 4. Run the Bot
+
+Launch the main trading bot script.
+
+```bash
+python bot.py
+```
+
+### 5. Run the Dashboard
+
+To view the dashboard, run the following command in a separate terminal (with the virtual environment still active).
+
+```bash
+streamlit run dashboard.py
+```
+
 ## Development Notes
 
 - The Docker image sets `PYTHONDONTWRITEBYTECODE=1` and `PYTHONUNBUFFERED=1` for cleaner logging.
