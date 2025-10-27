@@ -36,7 +36,9 @@
    ```powershell
    python bot.py
    ```
-   或者：
+   上述命令会启动交易机器人本身，持续拉取行情并写入 `data/`。
+
+   如需查看可视化仪表盘，则单独运行（可与机器人同时运行，建议在第二个终端中执行）：
    ```powershell
    streamlit run dashboard.py
    ```
