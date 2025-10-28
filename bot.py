@@ -340,7 +340,7 @@ def record_iteration_message(text: str) -> None:
     if current_iteration_messages is not None:
         current_iteration_messages.append(strip_ansi_codes(text).rstrip())
 
-def send_telegram_message(text: str) -> None:
+def _send_telegram_message(text: str) -> None:
     """Send a notification message to Telegram if credentials are configured."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -362,6 +362,32 @@ def send_telegram_message(text: str) -> None:
             )
     except Exception as exc:
         logging.error("Error sending Telegram message: %s", exc)
+
+def send_notification(text: str) -> None:
+    """Send a notification using the configured robot."""
+    robot_preference = os.getenv("ROBOT", "telegram").lower()
+    if robot_preference == 'dingtalk':
+        try:
+            from utils.dingtalk_bot import DingTalkBot
+            ding_bot = DingTalkBot()
+            ding_bot.send_message(text)
+        except Exception as e:
+            logging.error(f"Error sending DingTalk message: {e}")
+    elif robot_preference == 'telegram':
+        _send_telegram_message(text)
+
+def send_notification(text: str) -> None:
+    """Send a notification using the configured robot."""
+    robot_preference = os.getenv("ROBOT", "telegram").lower()
+    if robot_preference == 'dingtalk':
+        try:
+            from utils.dingtalk_bot import DingTalkBot
+            ding_bot = DingTalkBot()
+            ding_bot.send_message(text)
+        except Exception as e:
+            logging.error(f"Error sending DingTalk message: {e}")
+    elif robot_preference == 'telegram':
+        send_telegram_message(text)
         
 def notify_error(
     message: str,
@@ -378,7 +404,7 @@ def notify_error(
         content=message,
         metadata=metadata,
     )
-    send_telegram_message(message)
+    send_notification(message)
 
 # ───────────────────────── STATE MGMT ───────────────────────
 
@@ -929,14 +955,16 @@ IMPORTANT:
     return "\n".join(prompt_lines)
 
 def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
-    """Call OpenRouter API with DeepSeek Chat V3.1."""
+    """Call OpenRouter API with a configurable model."""
+    model_name = os.getenv("OPENROUTER_MODEL_NAME", "deepseek/deepseek-chat")
+
     try:
         log_ai_message(
             direction="sent",
             role="system",
             content=TRADING_RULES_PROMPT,
             metadata={
-                "model": "deepseek/deepseek-chat-v3.1",
+                "model": model_name,
                 "temperature": 0.7,
                 "max_tokens": 4000
             }
@@ -946,7 +974,7 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
             role="user",
             content=prompt,
             metadata={
-                "model": "deepseek/deepseek-chat-v3.1",
+                "model": model_name,
                 "temperature": 0.7,
                 "max_tokens": 4000
             }
@@ -961,7 +989,7 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
                 "X-Title": "DeepSeek Trading Bot",
             },
             json={
-                "model": "deepseek/deepseek-chat-v3.1",
+                "model": model_name,
                 "messages": [
                     {
                         "role": "system",
@@ -1419,10 +1447,16 @@ def main() -> None:
     
     logging.info(f"Starting capital: ${START_CAPITAL:.2f}")
     logging.info(f"Monitoring: {', '.join(SYMBOL_TO_COIN.values())}")
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        logging.info("Telegram notifications enabled (chat: %s).", TELEGRAM_CHAT_ID)
+    robot_preference = os.getenv("ROBOT", "telegram").lower()
+    if robot_preference == 'telegram':
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            logging.info("Telegram notifications enabled (chat: %s).", TELEGRAM_CHAT_ID)
+        else:
+            logging.info("Telegram notifications disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+    elif robot_preference == 'dingtalk':
+        logging.info("DingTalk notifications enabled.")
     else:
-        logging.info("Telegram notifications disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+        logging.info("No valid ROBOT configured, notifications are disabled.")
     
     while True:
         try:
@@ -1655,7 +1689,7 @@ def main() -> None:
             record_iteration_message(line)
 
             if current_iteration_messages:
-                send_telegram_message("\n".join(current_iteration_messages))
+                send_notification("\n".join(current_iteration_messages))
             
             # Log state
             log_portfolio_state()

@@ -16,10 +16,23 @@ The Streamlit dashboard provides real-time monitoring of the trading bot's perfo
 
 ## How It Works
 - Every three minutes the bot fetches fresh candles for `ETH`, `SOL`, `XRP`, `BTC`, `DOGE`, and `BNB`, updates EMA/RSI/MACD indicators, and snapshots current positions.
+  - **API Calls**: Every 3 minutes, the bot makes one call to the OpenRouter (DeepSeek) API. Before this, it makes multiple calls to the Binance API for *each* of the configured cryptocurrencies to gather market data (k-line data, open interest, funding rates).
 - The snapshot is turned into a detailed DeepSeek prompt that includes balances, unrealised PnL, open orders, and indicator values.
+  - **Prompt Details**: The prompt is dynamically generated and includes:
+    1.  A preamble with general trading rules (`TRADING_RULES_PROMPT`).
+    2.  Current time and bot uptime.
+    3.  A detailed market snapshot for *each* coin (current price, EMA, MACD, RSI, open interest, funding rates, recent intraday (3-minute) and longer-term (4-hour) price and indicator series).
+    4.  Current account information (total return, available cash, allocated margin, unrealized PnL, current account value).
+    5.  Detailed information about any open positions.
+    6.  Instructions for the AI to return a JSON object with trading decisions (`hold`, `entry`, or `close`) for each coin.
 - A trading rules system prompt (see below) is sent alongside the user prompt so the model always receives the risk framework before making decisions.
 - DeepSeek replies with JSON decisions (`hold`, `entry`, or `close`) per asset. The bot enforces position sizing, places entries/closes, and persists results.
 - Portfolio state, trade history, AI requests/responses, and per-iteration console transcripts are written to `data/` for later inspection or dashboard visualisation.
+  - **Logging Details**:
+    *   `data/ai_messages.csv`: Logs raw requests and responses to/from the AI API.
+    *   `data/ai_decisions.csv`: Logs the parsed JSON decisions from the AI.
+    *   `data/trade_history.csv`: Logs any executed trades (entries or closes).
+    *   `data/portfolio_state.csv`: Logs a snapshot of the entire portfolio's state every iteration.
 
 ## System Prompt & Decision Contract
 DeepSeek is primed with a risk-first system prompt that stresses:

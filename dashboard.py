@@ -80,7 +80,10 @@ def load_csv(path: Path, parse_dates: List[str] | None = None) -> pd.DataFrame:
     """Load a CSV into a DataFrame, returning empty frame when missing."""
     if not path.exists():
         return pd.DataFrame()
-    return pd.read_csv(path, parse_dates=parse_dates)
+    try:
+        return pd.read_csv(path, parse_dates=parse_dates, encoding='utf-8')
+    except UnicodeDecodeError:
+        return pd.read_csv(path, parse_dates=parse_dates, encoding='gbk')
 
 
 @st.cache_data(ttl=15)
