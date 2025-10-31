@@ -1451,6 +1451,26 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         return
     
     side = str(decision.get('side', 'long')).lower()
+    raw_reason = str(decision.get('justification', '')).strip()
+    reason_text_compact = " ".join(raw_reason.split()) if raw_reason else ""
+    if reason_text_compact:
+        contradictory_phrases = (
+            "no entry",
+            "no long entry",
+            "no short entry",
+            "do not enter",
+            "avoid entry",
+            "skip entry",
+        )
+        reason_lower = reason_text_compact.lower()
+        if any(phrase in reason_lower for phrase in contradictory_phrases):
+            logging.warning(
+                "%s: Skipping entry because AI justification contradicts signal (%s)",
+                coin,
+                reason_text_compact,
+            )
+            return
+
     leverage_raw = decision.get('leverage', 10)
     try:
         leverage = float(leverage_raw)
@@ -1474,6 +1494,49 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     except (KeyError, TypeError, ValueError):
         logging.warning(f"{coin}: Invalid stop loss or profit target in decision; skipping entry.")
         return
+    if stop_loss_price <= 0 or profit_target_price <= 0:
+        logging.warning(
+            "%s: Non-positive stop loss (%s) or profit target (%s); skipping entry.",
+            coin,
+            stop_loss_price,
+            profit_target_price,
+        )
+        return
+    
+    if side == 'long':
+        if stop_loss_price >= current_price:
+            logging.warning(
+                "%s: Stop loss %s not below current price %s for long; skipping entry.",
+                coin,
+                stop_loss_price,
+                current_price,
+            )
+            return
+        if profit_target_price <= current_price:
+            logging.warning(
+                "%s: Profit target %s not above current price %s for long; skipping entry.",
+                coin,
+                profit_target_price,
+                current_price,
+            )
+            return
+    elif side == 'short':
+        if stop_loss_price <= current_price:
+            logging.warning(
+                "%s: Stop loss %s not above current price %s for short; skipping entry.",
+                coin,
+                stop_loss_price,
+                current_price,
+            )
+            return
+        if profit_target_price >= current_price:
+            logging.warning(
+                "%s: Profit target %s not below current price %s for short; skipping entry.",
+                coin,
+                profit_target_price,
+                current_price,
+            )
+            return
     
     # Calculate position size based on risk
     stop_distance = abs(current_price - stop_loss_price)
@@ -1526,7 +1589,6 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
             return
     
     # Open position
-    raw_reason = str(decision.get('justification', '')).strip()
     positions[coin] = {
         'side': side,
         'quantity': quantity,
