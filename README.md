@@ -158,6 +158,22 @@ The top-level metrics include Sharpe and Sortino ratios alongside balance, equit
 
 ---
 
+## Reconcile Portfolio State After Editing Trades
+
+If you manually edit `data/trade_history.csv` (for example, deleting erroneous trades) run the reconciliation helper to rebuild `portfolio_state.json` from the remaining rows:
+
+```bash
+python3 scripts/recalculate_portfolio.py
+```
+
+- The script replays the trade log from the configured starting capital (respects `PAPER_START_CAPITAL`, `HYPERLIQUID_CAPITAL`, and `HYPERLIQUID_LIVE_TRADING`).
+- Open positions are recreated with their margin, leverage, and risk metrics; the resulting balance and positions are written to `data/portfolio_state.json`.
+- Use `--dry-run` to inspect the reconstructed state without updating files, or `--start-capital 7500` to override the initial balance.
+
+This keeps the bot's persisted state consistent with the edited trade history before restarting the live loop.
+
+---
+
 ## Historical Backtesting
 
 The repository ships with a replay harness (`backtest.py`) so you can evaluate prompts and LLM choices on cached Binance data without touching the live loop.
