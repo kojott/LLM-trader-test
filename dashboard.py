@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -96,6 +95,7 @@ def get_portfolio_state() -> pd.DataFrame:
         "num_positions",
         "total_margin",
         "net_unrealized_pnl",
+        "btc_price",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -143,36 +143,6 @@ def get_ai_messages() -> pd.DataFrame:
         return df
     df.sort_values("timestamp", inplace=True, ascending=False)
     return df
-
-
-@st.cache_data(ttl=60)
-def get_local_btc_price_series() -> pd.DataFrame:
-    """Extract BTC prices from logged AI messages (no external calls)."""
-    messages_df = load_csv(MESSAGES_CSV, parse_dates=["timestamp"])
-    if messages_df.empty or "content" not in messages_df.columns:
-        return pd.DataFrame()
-
-    pattern = re.compile(r"BTC MARKET SNAPSHOT.*?- Price:\s*([0-9.,]+)", re.DOTALL)
-
-    def _extract_price(text: str) -> float | None:
-        matches = pattern.findall(str(text))
-        if not matches:
-            return None
-        raw_value = matches[-1].replace(",", "")
-        try:
-            return float(raw_value)
-        except ValueError:
-            return None
-
-    messages_df["btc_price"] = messages_df["content"].apply(_extract_price)
-    price_df = (
-        messages_df.dropna(subset=["btc_price"])[["timestamp", "btc_price"]]
-        .drop_duplicates(subset=["timestamp"])
-        .sort_values("timestamp")
-    )
-    price_df["btc_price"] = pd.to_numeric(price_df["btc_price"], errors="coerce")
-    price_df.dropna(subset=["btc_price"], inplace=True)
-    return price_df
 
 
 def parse_positions(position_text: str | float) -> pd.DataFrame:
@@ -381,9 +351,8 @@ def render_portfolio_tab(state_df: pd.DataFrame, trades_df: pd.DataFrame) -> Non
         )
     ]
 
-    btc_series = get_local_btc_price_series()
     btc_caption = None
-    if not btc_series.empty and len(state_df.index) > 0:
+    if "btc_price" in state_df.columns and len(state_df.index) > 0:
         timeline = (
             state_df.reset_index()[["timestamp"]]
             .assign(
@@ -394,15 +363,19 @@ def render_portfolio_tab(state_df: pd.DataFrame, trades_df: pd.DataFrame) -> Non
             .dropna(subset=["timestamp"])
             .sort_values("timestamp")
         )
-        btc_timeline = (
-            btc_series[["timestamp", "btc_price"]]
+        btc_series = (
+            state_df.reset_index()[["timestamp", "btc_price"]]
             .assign(
                 timestamp=lambda df_: pd.to_datetime(
                     df_["timestamp"], errors="coerce", utc=True
-                ).dt.tz_convert(None)
+                ).dt.tz_convert(None),
+                btc_price=lambda df_: pd.to_numeric(df_["btc_price"], errors="coerce"),
             )
             .dropna(subset=["timestamp"])
             .sort_values("timestamp")
+        )
+        btc_timeline = (
+            btc_series.dropna(subset=["btc_price"])
         )
         if not timeline.empty and not btc_timeline.empty:
             benchmark = pd.merge_asof(
@@ -426,7 +399,7 @@ def render_portfolio_tab(state_df: pd.DataFrame, trades_df: pd.DataFrame) -> Non
                             }
                         )
                     )
-                    btc_caption = "BTC benchmark derived from logged market snapshots."
+                    btc_caption = "BTC benchmark derived from portfolio_state.csv."
 
     equity_chart_df = pd.concat(chart_frames, ignore_index=True)
     equity_chart_df["timestamp"] = pd.to_datetime(

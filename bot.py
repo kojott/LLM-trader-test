@@ -460,8 +460,10 @@ STATE_COLUMNS = [
     'num_positions',
     'position_details',
     'total_margin',
-    'net_unrealized_pnl'
+    'net_unrealized_pnl',
+    'btc_price',
 ]
+last_btc_price: Optional[float] = None
 
 # ───────────────────────── CSV LOGGING ──────────────────────
 
@@ -471,6 +473,22 @@ def init_csv_files() -> None:
         with open(STATE_CSV, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(STATE_COLUMNS)
+    else:
+        try:
+            df = pd.read_csv(STATE_CSV)
+        except Exception as exc:
+            logging.warning("Unable to load %s for schema check: %s", STATE_CSV, exc)
+        else:
+            if list(df.columns) != STATE_COLUMNS:
+                for column in STATE_COLUMNS:
+                    if column not in df.columns:
+                        df[column] = np.nan
+                try:
+                    df = df[STATE_COLUMNS]
+                except KeyError:
+                    # Fall back to writing header only if severe mismatch
+                    df = pd.DataFrame(columns=STATE_COLUMNS)
+                df.to_csv(STATE_CSV, index=False)
     
     if not TRADES_CSV.exists():
         with open(TRADES_CSV, 'w', newline='') as f:
@@ -495,6 +513,17 @@ def init_csv_files() -> None:
                 'timestamp', 'direction', 'role', 'content', 'metadata'
             ])
 
+def get_btc_benchmark_price() -> Optional[float]:
+    """Fetch the current BTC/USDT price for benchmarking."""
+    global last_btc_price
+    data = fetch_market_data("BTCUSDT")
+    if data and "price" in data:
+        try:
+            last_btc_price = float(data["price"])
+        except (TypeError, ValueError):
+            logging.debug("Received non-numeric BTC price: %s", data["price"])
+    return last_btc_price
+
 def log_portfolio_state() -> None:
     """Log current portfolio state."""
     total_equity = calculate_total_equity()
@@ -507,6 +536,9 @@ def log_portfolio_state() -> None:
         for coin, pos in positions.items()
     ]) if positions else "No positions"
     
+    btc_price = get_btc_benchmark_price()
+    btc_price_str = f"{btc_price:.2f}" if btc_price is not None else ""
+
     with open(STATE_CSV, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -517,7 +549,8 @@ def log_portfolio_state() -> None:
             len(positions),
             position_details,
             f"{total_margin:.2f}",
-            f"{net_unrealized:.2f}"
+            f"{net_unrealized:.2f}",
+            btc_price_str,
         ])
 
 def log_trade(coin: str, action: str, details: Dict[str, Any]) -> None:
@@ -920,6 +953,9 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "ignore",
             ],
         )
+        if df_intraday.empty:
+            logging.warning("Skipping market snapshot for %s: intraday klines unavailable.", symbol)
+            return None
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
         df_intraday[numeric_cols] = df_intraday[numeric_cols].astype(float)
@@ -948,6 +984,9 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "ignore",
             ],
         )
+        if df_long.empty:
+            logging.warning("Skipping market snapshot for %s: long-term klines unavailable.", symbol)
+            return None
         df_long[numeric_cols] = df_long[numeric_cols].astype(float)
         df_long = add_indicator_columns(
             df_long,

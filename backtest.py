@@ -464,6 +464,12 @@ def main() -> None:
         bot.log_system_prompt_info("Backtest system prompt")
         print(f"System prompt for this backtest: {bot.describe_system_prompt_source()}")
 
+    if getattr(bot, "INTERVAL", None) != cfg.interval:
+        logging.info("Aligning bot interval with backtest interval: %s → %s", getattr(bot, "INTERVAL", None), cfg.interval)
+        bot.INTERVAL = cfg.interval
+        if hasattr(bot, "_INTERVAL_TO_SECONDS"):
+            bot.CHECK_INTERVAL = bot._INTERVAL_TO_SECONDS[cfg.interval]  # type: ignore[attr-defined]
+
     logging.info("Backtest configured with LLM model: %s", bot.LLM_MODEL_NAME)
     print(f"LLM model for this backtest: {bot.LLM_MODEL_NAME}")
 
