@@ -1691,20 +1691,15 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     reason_text = raw_reason or "No justification provided."
     reason_text = " ".join(reason_text.split())
 
-    gross_target_sign = '+' if gross_at_target >= 0 else '-'
-    gross_stop_sign = '+' if gross_at_stop >= 0 else '-'
-    net_target_sign = '+' if net_at_target >= 0 else '-'
-    net_stop_sign = '+' if net_at_stop >= 0 else '-'
-
     line = (
-        f"  ├─ PnL @ Target: {gross_target_sign}${abs(gross_at_target):.2f} "
-        f"(Net: {net_target_sign}${abs(net_at_target):.2f})"
+        f"  ├─ PnL @ Target: ${gross_at_target:+.2f} "
+        f"(Net: ${net_at_target:+.2f})"
     )
     print(line)
     record_iteration_message(line)
     line = (
-        f"  ├─ PnL @ Stop: {gross_stop_sign}${abs(gross_at_stop):.2f} "
-        f"(Net: {net_stop_sign}${abs(net_at_stop):.2f})"
+        f"  ├─ PnL @ Stop: ${gross_at_stop:+.2f} "
+        f"(Net: ${net_at_stop:+.2f})"
     )
     print(line)
     record_iteration_message(line)
@@ -1933,18 +1928,12 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
 
             pnl_color = Fore.GREEN if net_unrealized >= 0 else Fore.RED
             gross_color = Fore.GREEN if gross_unrealized >= 0 else Fore.RED
-            net_display = f"${abs(net_unrealized):.2f}"
-            if net_unrealized >= 0:
-                net_display = f"+{net_display}"
-            gross_display = f"{gross_color}${abs(gross_unrealized):.2f}{Style.RESET_ALL}"
-            gross_target_sign = "+" if gross_at_target >= 0 else "-"
-            net_target_sign = "+" if net_at_target >= 0 else "-"
-            gross_stop_sign = "+" if gross_at_stop >= 0 else "-"
-            net_stop_sign = "+" if net_at_stop >= 0 else "-"
-            net_target_display = f"{net_target_sign}${abs(net_at_target):.2f}"
-            net_stop_display = f"{net_stop_sign}${abs(net_at_stop):.2f}"
-            gross_target_display = f"{gross_target_sign}${abs(gross_at_target):.2f}"
-            gross_stop_display = f"{gross_stop_sign}${abs(gross_at_stop):.2f}"
+            net_display = f"{net_unrealized:+.2f}"
+            gross_display = f"{gross_unrealized:+.2f}"
+            gross_target_display = f"{gross_at_target:+.2f}"
+            gross_stop_display = f"{gross_at_stop:+.2f}"
+            net_target_display = f"{net_at_target:+.2f}"
+            net_stop_display = f"{net_at_stop:+.2f}"
 
             line = f"{Fore.BLUE}[HOLD] {coin} {pos['side'].upper()} {leverage_display}"
             print(line)
@@ -1956,20 +1945,20 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             print(line)
             record_iteration_message(line)
             line = (
-                f"  ├─ PnL: {pnl_color}{net_display}{Style.RESET_ALL} "
-                f"(Gross: {gross_display}, Fees: ${total_fees_now:.2f})"
+                f"  ├─ PnL: {pnl_color}${net_display}{Style.RESET_ALL} "
+                f"(Gross: {gross_color}${gross_display}{Style.RESET_ALL}, Fees: ${total_fees_now:.2f})"
             )
             print(line)
             record_iteration_message(line)
             line = (
-                f"  ├─ PnL @ Target: {gross_target_display} "
-                f"(Net: {net_target_display})"
+                f"  ├─ PnL @ Target: ${gross_target_display} "
+                f"(Net: ${net_target_display})"
             )
             print(line)
             record_iteration_message(line)
             line = (
-                f"  ├─ PnL @ Stop: {gross_stop_display} "
-                f"(Net: {net_stop_display})"
+                f"  ├─ PnL @ Stop: ${gross_stop_display} "
+                f"(Net: ${net_stop_display})"
             )
             print(line)
             record_iteration_message(line)
