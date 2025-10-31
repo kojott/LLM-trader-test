@@ -384,31 +384,56 @@ def render_portfolio_tab(state_df: pd.DataFrame, trades_df: pd.DataFrame) -> Non
     btc_series = get_local_btc_price_series()
     btc_caption = None
     if not btc_series.empty and len(state_df.index) > 0:
-        timeline = state_df.reset_index()[["timestamp"]].sort_values("timestamp")
-        benchmark = pd.merge_asof(
-            timeline,
-            btc_series.sort_values("timestamp"),
-            on="timestamp",
-            direction="backward",
+        timeline = (
+            state_df.reset_index()[["timestamp"]]
+            .assign(
+                timestamp=lambda df_: pd.to_datetime(
+                    df_["timestamp"], errors="coerce", utc=True
+                ).dt.tz_convert(None)
+            )
+            .dropna(subset=["timestamp"])
+            .sort_values("timestamp")
         )
-        benchmark["btc_price"] = benchmark["btc_price"].ffill().bfill()
-        valid_prices = benchmark["btc_price"].dropna()
-        if not valid_prices.empty:
-            base_price = float(valid_prices.iloc[0])
-            if base_price > 0:
-                btc_values = base_investment * (benchmark["btc_price"] / base_price)
-                chart_frames.append(
-                    pd.DataFrame(
-                        {
-                            "timestamp": benchmark["timestamp"],
-                            "Series": "BTC buy & hold",
-                            "Value": btc_values,
-                        }
+        btc_timeline = (
+            btc_series[["timestamp", "btc_price"]]
+            .assign(
+                timestamp=lambda df_: pd.to_datetime(
+                    df_["timestamp"], errors="coerce", utc=True
+                ).dt.tz_convert(None)
+            )
+            .dropna(subset=["timestamp"])
+            .sort_values("timestamp")
+        )
+        if not timeline.empty and not btc_timeline.empty:
+            benchmark = pd.merge_asof(
+                timeline,
+                btc_timeline,
+                on="timestamp",
+                direction="backward",
+            )
+            benchmark["btc_price"] = benchmark["btc_price"].ffill().bfill()
+            valid_prices = benchmark["btc_price"].dropna()
+            if not valid_prices.empty:
+                base_price = float(valid_prices.iloc[0])
+                if base_price > 0:
+                    btc_values = base_investment * (benchmark["btc_price"] / base_price)
+                    chart_frames.append(
+                        pd.DataFrame(
+                            {
+                                "timestamp": benchmark["timestamp"],
+                                "Series": "BTC buy & hold",
+                                "Value": btc_values,
+                            }
+                        )
                     )
-                )
-                btc_caption = "BTC benchmark derived from logged market snapshots."
+                    btc_caption = "BTC benchmark derived from logged market snapshots."
 
-    equity_chart_df = pd.concat(chart_frames).dropna(subset=["timestamp", "Value"])
+    equity_chart_df = pd.concat(chart_frames, ignore_index=True)
+    equity_chart_df["timestamp"] = pd.to_datetime(
+        equity_chart_df["timestamp"], errors="coerce", utc=True
+    ).dt.tz_convert(None)
+    equity_chart_df["Value"] = pd.to_numeric(equity_chart_df["Value"], errors="coerce")
+    equity_chart_df.dropna(subset=["timestamp", "Value"], inplace=True)
     equity_chart_df.sort_values("timestamp", inplace=True)
 
     lower = float(equity_chart_df["Value"].min())
