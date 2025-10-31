@@ -12,7 +12,7 @@ import json
 import logging
 import csv
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,6 +23,8 @@ from requests.exceptions import RequestException, Timeout
 from binance.client import Client
 from dotenv import load_dotenv
 from colorama import Fore, Style, init as colorama_init
+
+from hyperliquid_client import HyperliquidTradingClient
 
 colorama_init(autoreset=True)
 
@@ -38,12 +40,92 @@ DEFAULT_DATA_DIR = BASE_DIR / "data"
 DATA_DIR = Path(os.getenv("TRADEBOT_DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+EARLY_ENV_WARNINGS: List[str] = []
+
+def _parse_bool_env(value: Optional[str], *, default: bool = False) -> bool:
+    """Convert environment string to bool with sensible defaults."""
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _parse_float_env(value: Optional[str], *, default: float) -> float:
+    """Convert environment string to float with fallback and logging."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        EARLY_ENV_WARNINGS.append(
+            f"Invalid float environment value '{value}'; using default {default:.2f}"
+        )
+        return default
+
+
+def _parse_int_env(value: Optional[str], *, default: int) -> int:
+    """Convert environment string to int with fallback and logging."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        EARLY_ENV_WARNINGS.append(
+            f"Invalid int environment value '{value}'; using default {default}"
+        )
+        return default
+
+
+def _parse_thinking_env(value: Optional[str]) -> Optional[Any]:
+    """Parse LLM thinking budget/configuration from environment."""
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    return raw
+
+
 # ───────────────────────── CONFIG ─────────────────────────
 API_KEY = os.getenv("BN_API_KEY", "")
 API_SECRET = os.getenv("BN_SECRET", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+HYPERLIQUID_LIVE_TRADING = _parse_bool_env(
+    os.getenv("HYPERLIQUID_LIVE_TRADING"),
+    default=False,
+)
+HYPERLIQUID_WALLET_ADDRESS = os.getenv("HYPERLIQUID_WALLET_ADDRESS", "")
+HYPERLIQUID_PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+
+PAPER_START_CAPITAL = _parse_float_env(
+    os.getenv("PAPER_START_CAPITAL"),
+    default=10000.0,
+)
+HYPERLIQUID_CAPITAL = _parse_float_env(
+    os.getenv("HYPERLIQUID_CAPITAL"),
+    default=500.0,
+)
+
+START_CAPITAL = HYPERLIQUID_CAPITAL if HYPERLIQUID_LIVE_TRADING else PAPER_START_CAPITAL
 
 # Trading symbols to monitor
 SYMBOLS = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "BTCUSDT", "DOGEUSDT", "BNBUSDT"]
@@ -55,8 +137,9 @@ SYMBOL_TO_COIN = {
     "DOGEUSDT": "DOGE",
     "BNBUSDT": "BNB"
 }
+COIN_TO_SYMBOL = {coin: symbol for symbol, coin in SYMBOL_TO_COIN.items()}
 
-TRADING_RULES_PROMPT = """
+DEFAULT_TRADING_RULES_PROMPT = """
 You are a top level crypto trader focused on multiplying the account while safeguarding capital. Always apply these core rules:
 
 Most Important Rules for Crypto Traders
@@ -103,10 +186,128 @@ Stay Informed but Trade Less
 - Track market-moving news but trade only when indicators align and risk-reward is favorable.
 """.strip()
 
-INTERVAL = "3m"  # 3-minute candles as per DeepSeek example
-START_CAPITAL = 10000.0
-CHECK_INTERVAL = 180  # Check every 3 minutes (when candle closes)
+SYSTEM_PROMPT_SOURCE: Dict[str, Any] = {"type": "default"}
+
+
+def _load_system_prompt() -> str:
+    """Load system prompt from env variables or fall back to default."""
+    global SYSTEM_PROMPT_SOURCE
+    prompt_file = os.getenv("TRADEBOT_SYSTEM_PROMPT_FILE")
+    if prompt_file:
+        path = Path(prompt_file).expanduser()
+        if not path.is_absolute():
+            path = (BASE_DIR / path).resolve()
+        try:
+            if path.exists():
+                SYSTEM_PROMPT_SOURCE = {"type": "file", "path": str(path)}
+                return path.read_text(encoding="utf-8").strip()
+            EARLY_ENV_WARNINGS.append(
+                f"System prompt file '{path}' not found; using default prompt."
+            )
+        except Exception as exc:
+            EARLY_ENV_WARNINGS.append(
+                f"Failed to read system prompt file '{path}': {exc}; using default prompt."
+            )
+
+    prompt_env = os.getenv("TRADEBOT_SYSTEM_PROMPT")
+    if prompt_env:
+        SYSTEM_PROMPT_SOURCE = {"type": "env"}
+        return prompt_env.strip()
+
+    SYSTEM_PROMPT_SOURCE = {"type": "default"}
+    return DEFAULT_TRADING_RULES_PROMPT
+
+
+def describe_system_prompt_source() -> str:
+    """Return human-readable description of the active system prompt."""
+    source_type = SYSTEM_PROMPT_SOURCE.get("type", "default")
+    if source_type == "file":
+        return f"file:{SYSTEM_PROMPT_SOURCE.get('path', '?')}"
+    if source_type == "env":
+        return "env:TRADEBOT_SYSTEM_PROMPT"
+    return "default prompt"
+
+
+TRADING_RULES_PROMPT = _load_system_prompt()
+
+DEFAULT_INTERVAL = "3m"
+_INTERVAL_TO_SECONDS = {
+    "1m": 60,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+    "4h": 14400,
+    "6h": 21600,
+    "8h": 28800,
+    "12h": 43200,
+    "1d": 86400,
+}
+
+
+def _load_trade_interval(default: str = DEFAULT_INTERVAL) -> str:
+    """Resolve trade interval from environment."""
+    raw = os.getenv("TRADEBOT_INTERVAL")
+    if raw:
+        candidate = raw.strip().lower()
+        if candidate in _INTERVAL_TO_SECONDS:
+            return candidate
+        EARLY_ENV_WARNINGS.append(
+            f"Unsupported TRADEBOT_INTERVAL '{raw}'; using default {default}."
+        )
+    return default
+
+
+INTERVAL = _load_trade_interval()
+CHECK_INTERVAL = _INTERVAL_TO_SECONDS[INTERVAL]
 DEFAULT_RISK_FREE_RATE = 0.0  # Annualized baseline for Sortino ratio calculations
+DEFAULT_LLM_MODEL = "deepseek/deepseek-chat-v3.1"
+
+
+def _load_llm_model_name() -> str:
+    raw = os.getenv("TRADEBOT_LLM_MODEL", DEFAULT_LLM_MODEL)
+    if not raw:
+        return DEFAULT_LLM_MODEL
+    value = raw.strip()
+    return value or DEFAULT_LLM_MODEL
+
+
+def _load_llm_temperature() -> float:
+    return _parse_float_env(
+        os.getenv("TRADEBOT_LLM_TEMPERATURE"),
+        default=0.7,
+    )
+
+
+def _load_llm_max_tokens() -> int:
+    return _parse_int_env(
+        os.getenv("TRADEBOT_LLM_MAX_TOKENS"),
+        default=4000,
+    )
+
+
+def refresh_llm_configuration_from_env() -> None:
+    """Reload LLM-related runtime settings from environment variables."""
+    global LLM_MODEL_NAME, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_THINKING_PARAM, TRADING_RULES_PROMPT
+    LLM_MODEL_NAME = _load_llm_model_name()
+    LLM_TEMPERATURE = _load_llm_temperature()
+    LLM_MAX_TOKENS = _load_llm_max_tokens()
+    LLM_THINKING_PARAM = _parse_thinking_env(os.getenv("TRADEBOT_LLM_THINKING"))
+    TRADING_RULES_PROMPT = _load_system_prompt()
+
+
+def log_system_prompt_info(prefix: str = "System prompt in use") -> None:
+    """Log the current system prompt configuration."""
+    description = describe_system_prompt_source()
+    logging.info("%s: %s", prefix, description)
+
+
+LLM_MODEL_NAME = _load_llm_model_name()
+LLM_TEMPERATURE = _load_llm_temperature()
+LLM_MAX_TOKENS = _load_llm_max_tokens()
+LLM_THINKING_PARAM = _parse_thinking_env(os.getenv("TRADEBOT_LLM_THINKING"))
 
 # Indicator settings
 EMA_LEN = 20
@@ -125,6 +326,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
+
+for warning_msg in EARLY_ENV_WARNINGS:
+    logging.warning(warning_msg)
+EARLY_ENV_WARNINGS.clear()
 
 def _resolve_risk_free_rate() -> float:
     """Determine the annualized risk-free rate used in Sortino calculations."""
@@ -163,6 +368,16 @@ else:
     logging.error("OPENROUTER_API_KEY not found; please check your .env file.")
 
 client: Optional[Client] = None
+
+try:
+    hyperliquid_trader = HyperliquidTradingClient(
+        live_mode=HYPERLIQUID_LIVE_TRADING,
+        wallet_address=HYPERLIQUID_WALLET_ADDRESS,
+        secret_key=HYPERLIQUID_PRIVATE_KEY,
+    )
+except Exception as exc:
+    logging.critical("Hyperliquid live trading initialization failed: %s", exc)
+    raise SystemExit(1) from exc
 
 def get_binance_client() -> Optional[Client]:
     """Return a connected Binance client or None if initialization failed."""
@@ -205,7 +420,26 @@ def get_binance_client() -> Optional[Client]:
 balance: float = START_CAPITAL
 positions: Dict[str, Dict[str, Any]] = {}  # coin -> position info
 trade_history: List[Dict[str, Any]] = []
-BOT_START_TIME = datetime.now(timezone.utc)
+def _default_time_provider() -> datetime:
+    """Return current UTC time; overridable for testing/backtests."""
+    return datetime.now(timezone.utc)
+
+
+_current_time_provider: Callable[[], datetime] = _default_time_provider
+
+
+def get_current_time() -> datetime:
+    """Return the current time from the active provider."""
+    return _current_time_provider()
+
+
+def set_time_provider(provider: Optional[Callable[[], datetime]]) -> None:
+    """Override the time provider; pass None to restore wall-clock time."""
+    global _current_time_provider
+    _current_time_provider = provider or _default_time_provider
+
+
+BOT_START_TIME = get_current_time()
 invocation_count: int = 0
 iteration_counter: int = 0
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -276,7 +510,7 @@ def log_portfolio_state() -> None:
     with open(STATE_CSV, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().isoformat(),
+            get_current_time().isoformat(),
             f"{balance:.2f}",
             f"{total_equity:.2f}",
             f"{total_return:.2f}",
@@ -291,7 +525,7 @@ def log_trade(coin: str, action: str, details: Dict[str, Any]) -> None:
     with open(TRADES_CSV, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().isoformat(),
+            get_current_time().isoformat(),
             coin,
             action,
             details.get('side', ''),
@@ -311,7 +545,7 @@ def log_ai_decision(coin: str, signal: str, reasoning: str, confidence: float) -
     with open(DECISIONS_CSV, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().isoformat(),
+            get_current_time().isoformat(),
             coin,
             signal,
             reasoning,
@@ -324,7 +558,7 @@ def log_ai_message(direction: str, role: str, content: str, metadata: Optional[D
     with open(MESSAGES_CSV, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().isoformat(),
+            get_current_time().isoformat(),
             direction,
             role,
             content,
@@ -483,13 +717,27 @@ def save_state() -> None:
                     "balance": balance,
                     "positions": positions,
                     "iteration": iteration_counter,
-                    "updated_at": datetime.now().isoformat(),
+                    "updated_at": get_current_time().isoformat(),
                 },
                 f,
                 indent=2,
             )
     except Exception as e:
         logging.error("Failed to save state to %s: %s", STATE_JSON, e, exc_info=True)
+
+
+def reset_state(initial_balance: Optional[float] = None) -> None:
+    """Reset in-memory trading state to start a fresh run."""
+    global balance, positions, trade_history, iteration_counter, equity_history, invocation_count, current_iteration_messages, BOT_START_TIME
+    balance = float(initial_balance) if initial_balance is not None else START_CAPITAL
+    positions = {}
+    trade_history = []
+    iteration_counter = 0
+    invocation_count = 0
+    equity_history.clear()
+    current_iteration_messages = []
+    BOT_START_TIME = get_current_time()
+
 
 def load_equity_history() -> None:
     """Populate the in-memory equity history for performance calculations."""
@@ -603,34 +851,53 @@ def fetch_market_data(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         # Get recent klines
         klines = binance_client.get_klines(symbol=symbol, interval=INTERVAL, limit=50)
-        
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_base', 'taker_quote', 'ignore'
-        ])
-        
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['open'] = df['open'].astype(float)
-        
+
+        df = pd.DataFrame(
+            klines,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_volume",
+                "trades",
+                "taker_base",
+                "taker_quote",
+                "ignore",
+            ],
+        )
+
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["open"] = df["open"].astype(float)
+
         last = calculate_indicators(df)
-        
+        latest_bar = df.iloc[-1]
+        last_high = float(latest_bar["high"])
+        last_low = float(latest_bar["low"])
+        last_close = float(latest_bar["close"])
+
         # Get funding rate for perpetual futures
         try:
             funding_info = binance_client.futures_funding_rate(symbol=symbol, limit=1)
-            funding_rate = float(funding_info[0]['fundingRate']) if funding_info else 0
+            funding_rate = float(funding_info[0]["fundingRate"]) if funding_info else 0
         except:
             funding_rate = 0
-        
+
         return {
-            'symbol': symbol,
-            'price': last['close'],
-            'ema20': last['ema20'],
-            'rsi': last['rsi'],
-            'macd': last['macd'],
-            'macd_signal': last['macd_signal'],
-            'funding_rate': funding_rate
+            "symbol": symbol,
+            "price": last_close,
+            "high": last_high,
+            "low": last_low,
+            "ema20": last["ema20"],
+            "rsi": last["rsi"],
+            "macd": last["macd"],
+            "macd_signal": last["macd_signal"],
+            "funding_rate": funding_rate,
         }
     except Exception as e:
         logging.error(f"Error fetching data for {symbol}: {e}")
@@ -791,7 +1058,7 @@ def format_prompt_for_deepseek() -> str:
     global invocation_count
     invocation_count += 1
 
-    now = datetime.now(timezone.utc)
+    now = get_current_time()
     minutes_running = int((now - BOT_START_TIME).total_seconds() // 60)
 
     market_snapshots: Dict[str, Dict[str, Any]] = {}
@@ -828,7 +1095,7 @@ def format_prompt_for_deepseek() -> str:
     )
     prompt_lines.append("ALL PRICE OR SIGNAL SERIES BELOW ARE ORDERED OLDEST → NEWEST.")
     prompt_lines.append(
-        "Timeframe note: Intraday series use 3-minute intervals unless a different interval is explicitly mentioned."
+        f"Timeframe note: Intraday series use {INTERVAL} candles unless a different interval is explicitly mentioned."
     )
     prompt_lines.append("-" * 80)
     prompt_lines.append("CURRENT MARKET STATE FOR ALL COINS")
@@ -959,6 +1226,14 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
     model_name = os.getenv("OPENROUTER_MODEL_NAME", "deepseek/deepseek-chat")
 
     try:
+        request_metadata: Dict[str, Any] = {
+            "model": LLM_MODEL_NAME,
+            "temperature": LLM_TEMPERATURE,
+            "max_tokens": LLM_MAX_TOKENS,
+        }
+        if LLM_THINKING_PARAM is not None:
+            request_metadata["thinking"] = LLM_THINKING_PARAM
+
         log_ai_message(
             direction="sent",
             role="system",
@@ -979,6 +1254,24 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
                 "max_tokens": 4000
             }
         )
+
+        request_payload: Dict[str, Any] = {
+            "model": LLM_MODEL_NAME,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": TRADING_RULES_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": LLM_TEMPERATURE,
+            "max_tokens": LLM_MAX_TOKENS
+        }
+        if LLM_THINKING_PARAM is not None:
+            request_payload["thinking"] = LLM_THINKING_PARAM
 
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
@@ -1207,22 +1500,105 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         logging.warning(f"{coin}: Already have position, skipping entry")
         return
     
-    side = decision.get('side', 'long')
-    leverage = decision.get('leverage', 10)
+    side = str(decision.get('side', 'long')).lower()
+    raw_reason = str(decision.get('justification', '')).strip()
+    reason_text_compact = " ".join(raw_reason.split()) if raw_reason else ""
+    if reason_text_compact:
+        contradictory_phrases = (
+            "no entry",
+            "no long entry",
+            "no short entry",
+            "do not enter",
+            "avoid entry",
+            "skip entry",
+        )
+        reason_lower = reason_text_compact.lower()
+        if any(phrase in reason_lower for phrase in contradictory_phrases):
+            logging.warning(
+                "%s: Skipping entry because AI justification contradicts signal (%s)",
+                coin,
+                reason_text_compact,
+            )
+            return
+
+    leverage_raw = decision.get('leverage', 10)
+    try:
+        leverage = float(leverage_raw)
+        if leverage <= 0:
+            leverage = 1.0
+    except (TypeError, ValueError):
+        logging.warning(f"{coin}: Invalid leverage '%s'; defaulting to 1x", leverage_raw)
+        leverage = 1.0
     leverage_display = format_leverage_display(leverage)
-    risk_usd = decision.get('risk_usd', balance * 0.01)
+
+    risk_usd_raw = decision.get('risk_usd', balance * 0.01)
+    try:
+        risk_usd = float(risk_usd_raw)
+    except (TypeError, ValueError):
+        logging.warning(f"{coin}: Invalid risk_usd '%s'; defaulting to 1%% of balance.", risk_usd_raw)
+        risk_usd = balance * 0.01
+
+    try:
+        stop_loss_price = float(decision['stop_loss'])
+        profit_target_price = float(decision['profit_target'])
+    except (KeyError, TypeError, ValueError):
+        logging.warning(f"{coin}: Invalid stop loss or profit target in decision; skipping entry.")
+        return
+    if stop_loss_price <= 0 or profit_target_price <= 0:
+        logging.warning(
+            "%s: Non-positive stop loss (%s) or profit target (%s); skipping entry.",
+            coin,
+            stop_loss_price,
+            profit_target_price,
+        )
+        return
+    
+    if side == 'long':
+        if stop_loss_price >= current_price:
+            logging.warning(
+                "%s: Stop loss %s not below current price %s for long; skipping entry.",
+                coin,
+                stop_loss_price,
+                current_price,
+            )
+            return
+        if profit_target_price <= current_price:
+            logging.warning(
+                "%s: Profit target %s not above current price %s for long; skipping entry.",
+                coin,
+                profit_target_price,
+                current_price,
+            )
+            return
+    elif side == 'short':
+        if stop_loss_price <= current_price:
+            logging.warning(
+                "%s: Stop loss %s not above current price %s for short; skipping entry.",
+                coin,
+                stop_loss_price,
+                current_price,
+            )
+            return
+        if profit_target_price >= current_price:
+            logging.warning(
+                "%s: Profit target %s not below current price %s for short; skipping entry.",
+                coin,
+                profit_target_price,
+                current_price,
+            )
+            return
     
     # Calculate position size based on risk
-    stop_distance = abs(current_price - decision['stop_loss'])
+    stop_distance = abs(current_price - stop_loss_price)
     if stop_distance == 0:
         logging.warning(f"{coin}: Invalid stop loss, skipping")
         return
     
     quantity = risk_usd / stop_distance
     position_value = quantity * current_price
-    margin_required = position_value / leverage
+    margin_required = position_value / leverage if leverage else position_value
     
-    liquidity = decision.get('liquidity', 'taker').lower()
+    liquidity = str(decision.get('liquidity', 'taker')).lower()
     fee_rate = decision.get('fee_rate')
     if fee_rate is not None:
         try:
@@ -1241,17 +1617,36 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
             f"and fees ${entry_fee:.2f}"
         )
         return
+
+    live_entry_receipt = None
+    if hyperliquid_trader.is_live:
+        live_entry_receipt = hyperliquid_trader.place_entry_with_sl_tp(
+            coin=coin,
+            side=side,
+            size=quantity,
+            entry_price=current_price,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=profit_target_price,
+            leverage=leverage,
+            liquidity=liquidity,
+        )
+        if not live_entry_receipt.get("success"):
+            logging.error(
+                "%s: Live Hyperliquid entry rejected; aborting simulated entry. Response: %s",
+                coin,
+                live_entry_receipt.get("entry_result"),
+            )
+            return
     
     # Open position
-    raw_reason = str(decision.get('justification', '')).strip()
     positions[coin] = {
         'side': side,
         'quantity': quantity,
         'entry_price': current_price,
-        'profit_target': decision['profit_target'],
-        'stop_loss': decision['stop_loss'],
+        'profit_target': profit_target_price,
+        'stop_loss': stop_loss_price,
         'leverage': leverage,
-        'confidence': decision.get('confidence', 0.5),
+        'confidence': decision.get('confidence', 0),
         'invalidation_condition': decision.get('invalidation_condition', ''),
         'margin': margin_required,
         'fees_paid': entry_fee,
@@ -1265,12 +1660,17 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         'entry_justification': raw_reason,
         'last_justification': raw_reason,
     }
+    if hyperliquid_trader.is_live and live_entry_receipt:
+        positions[coin]['entry_oid'] = live_entry_receipt.get('entry_oid', positions[coin]['entry_oid'])
+        positions[coin]['tp_oid'] = live_entry_receipt.get('take_profit_oid', positions[coin]['tp_oid'])
+        positions[coin]['sl_oid'] = live_entry_receipt.get('stop_loss_oid', positions[coin]['sl_oid'])
+        positions[coin]['live_trading'] = True
     
     balance -= total_cost
     
     entry_price = current_price
-    target_price = decision['profit_target']
-    stop_price = decision['stop_loss']
+    target_price = profit_target_price
+    stop_price = stop_loss_price
 
     gross_at_target = calculate_pnl_for_price(positions[coin], target_price)
     gross_at_stop = calculate_pnl_for_price(positions[coin], stop_price)
@@ -1323,6 +1723,22 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         line = f"  ├─ Estimated Fee: ${entry_fee:.2f} ({liquidity} @ {fee_rate*100:.4f}%)"
         print(line)
         record_iteration_message(line)
+    if hyperliquid_trader.is_live and live_entry_receipt:
+        entry_oid = live_entry_receipt.get("entry_oid")
+        if entry_oid is not None:
+            line = f"  ├─ Hyperliquid Entry OID: {entry_oid}"
+            print(line)
+            record_iteration_message(line)
+        sl_oid = live_entry_receipt.get("stop_loss_oid")
+        if sl_oid is not None:
+            line = f"  ├─ Hyperliquid SL OID: {sl_oid}"
+            print(line)
+            record_iteration_message(line)
+        tp_oid = live_entry_receipt.get("take_profit_oid")
+        if tp_oid is not None:
+            line = f"  ├─ Hyperliquid TP OID: {tp_oid}"
+            print(line)
+            record_iteration_message(line)
     line = f"  ├─ Confidence: {decision.get('confidence', 0)*100:.0f}%"
     print(line)
     record_iteration_message(line)
@@ -1365,6 +1781,22 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
     exit_fee = pos['quantity'] * current_price * fee_rate
     total_fees = pos.get('fees_paid', 0.0) + exit_fee
     net_pnl = pnl - total_fees
+
+    live_close_receipt = None
+    if hyperliquid_trader.is_live:
+        live_close_receipt = hyperliquid_trader.close_position(
+            coin=coin,
+            side=pos['side'],
+            size=pos['quantity'],
+            fallback_price=current_price,
+        )
+        if not live_close_receipt.get("success"):
+            logging.error(
+                "%s: Live Hyperliquid close rejected; position remains open. Response: %s",
+                coin,
+                live_close_receipt.get("close_result"),
+            )
+            return
     
     # Return margin and add net PnL (after fees)
     balance += pos['margin'] + net_pnl
@@ -1380,6 +1812,12 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
         line = f"  ├─ Fees Paid: ${total_fees:.2f} (includes exit fee ${exit_fee:.2f})"
         print(line)
         record_iteration_message(line)
+    if hyperliquid_trader.is_live and live_close_receipt:
+        close_oid = live_close_receipt.get("close_oid")
+        if close_oid is not None:
+            line = f"  ├─ Hyperliquid Close OID: {close_oid}"
+            print(line)
+            record_iteration_message(line)
     line = f"  ├─ Net PnL: ${net_pnl:.2f}"
     print(line)
     record_iteration_message(line)
@@ -1408,28 +1846,186 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
     del positions[coin]
     save_state()
 
+
+def process_ai_decisions(decisions: Dict[str, Any]) -> None:
+    """Handle AI decisions for each tracked coin."""
+    for coin in SYMBOL_TO_COIN.values():
+        if coin not in decisions:
+            continue
+
+        decision = decisions[coin]
+        signal = decision.get("signal", "hold")
+
+        log_ai_decision(
+            coin,
+            signal,
+            decision.get("justification", ""),
+            decision.get("confidence", 0),
+        )
+
+        symbol = COIN_TO_SYMBOL.get(coin)
+        if not symbol:
+            logging.debug("No symbol mapping found for coin %s", coin)
+            continue
+
+        data = fetch_market_data(symbol)
+        if not data:
+            continue
+
+        current_price = data["price"]
+
+        if signal == "entry":
+            execute_entry(coin, decision, current_price)
+        elif signal == "close":
+            execute_close(coin, decision, current_price)
+        elif signal == "hold":
+            if coin not in positions:
+                continue
+            pos = positions[coin]
+            raw_reason = str(decision.get("justification", "")).strip()
+            if raw_reason:
+                reason_text = " ".join(raw_reason.split())
+                pos["last_justification"] = reason_text
+            else:
+                existing_reason = str(pos.get("last_justification", "")).strip()
+                reason_text = existing_reason or "No justification provided."
+                if not existing_reason:
+                    pos["last_justification"] = reason_text
+            try:
+                quantity = float(pos.get("quantity", 0.0))
+            except (TypeError, ValueError):
+                quantity = 0.0
+            try:
+                fees_paid = float(pos.get("fees_paid", 0.0))
+            except (TypeError, ValueError):
+                fees_paid = 0.0
+            try:
+                entry_price = float(pos.get("entry_price", 0.0))
+            except (TypeError, ValueError):
+                entry_price = 0.0
+            try:
+                target_price = float(pos.get("profit_target", entry_price))
+            except (TypeError, ValueError):
+                target_price = entry_price
+            try:
+                stop_price = float(pos.get("stop_loss", entry_price))
+            except (TypeError, ValueError):
+                stop_price = entry_price
+            leverage_display = format_leverage_display(pos.get("leverage", 1.0))
+            try:
+                margin_value = float(pos.get("margin", 0.0))
+            except (TypeError, ValueError):
+                margin_value = 0.0
+            try:
+                risk_value = float(pos.get("risk_usd", 0.0))
+            except (TypeError, ValueError):
+                risk_value = 0.0
+
+            gross_unrealized = calculate_unrealized_pnl(coin, current_price)
+            estimated_exit_fee_now = estimate_exit_fee(pos, current_price)
+            total_fees_now = fees_paid + estimated_exit_fee_now
+            net_unrealized = gross_unrealized - total_fees_now
+
+            gross_at_target = calculate_pnl_for_price(pos, target_price)
+            exit_fee_target = estimate_exit_fee(pos, target_price)
+            net_at_target = gross_at_target - (fees_paid + exit_fee_target)
+
+            gross_at_stop = calculate_pnl_for_price(pos, stop_price)
+            exit_fee_stop = estimate_exit_fee(pos, stop_price)
+            net_at_stop = gross_at_stop - (fees_paid + exit_fee_stop)
+
+            expected_reward = max(gross_at_target, 0.0)
+            expected_risk = max(-gross_at_stop, 0.0)
+            if expected_risk > 0:
+                rr_value = expected_reward / expected_risk if expected_reward > 0 else 0.0
+                rr_display = f"{rr_value:.2f}:1"
+            else:
+                rr_display = "n/a"
+
+            pnl_color = Fore.GREEN if net_unrealized >= 0 else Fore.RED
+            gross_color = Fore.GREEN if gross_unrealized >= 0 else Fore.RED
+            net_display = f"${abs(net_unrealized):.2f}"
+            if net_unrealized >= 0:
+                net_display = f"+{net_display}"
+            gross_display = f"{gross_color}${abs(gross_unrealized):.2f}{Style.RESET_ALL}"
+            gross_target_sign = "+" if gross_at_target >= 0 else "-"
+            net_target_sign = "+" if net_at_target >= 0 else "-"
+            gross_stop_sign = "+" if gross_at_stop >= 0 else "-"
+            net_stop_sign = "+" if net_at_stop >= 0 else "-"
+            net_target_display = f"{net_target_sign}${abs(net_at_target):.2f}"
+            net_stop_display = f"{net_stop_sign}${abs(net_at_stop):.2f}"
+            gross_target_display = f"{gross_target_sign}${abs(gross_at_target):.2f}"
+            gross_stop_display = f"{gross_stop_sign}${abs(gross_at_stop):.2f}"
+
+            line = f"{Fore.BLUE}[HOLD] {coin} {pos['side'].upper()} {leverage_display}"
+            print(line)
+            record_iteration_message(line)
+            line = f"  ├─ Size: {quantity:.4f} {coin} | Margin: ${margin_value:.2f}"
+            print(line)
+            record_iteration_message(line)
+            line = f"  ├─ TP: ${target_price:.4f} | SL: ${stop_price:.4f}"
+            print(line)
+            record_iteration_message(line)
+            line = (
+                f"  ├─ PnL: {pnl_color}{net_display}{Style.RESET_ALL} "
+                f"(Gross: {gross_display}, Fees: ${total_fees_now:.2f})"
+            )
+            print(line)
+            record_iteration_message(line)
+            line = (
+                f"  ├─ PnL @ Target: {gross_target_display} "
+                f"(Net: {net_target_display})"
+            )
+            print(line)
+            record_iteration_message(line)
+            line = (
+                f"  ├─ PnL @ Stop: {gross_stop_display} "
+                f"(Net: {net_stop_display})"
+            )
+            print(line)
+            record_iteration_message(line)
+            line = f"  ├─ Reward/Risk: {rr_display}"
+            print(line)
+            record_iteration_message(line)
+            line = f"  └─ Reason: {reason_text}"
+            print(line)
+            record_iteration_message(line)
+
 def check_stop_loss_take_profit() -> None:
-    """Check and execute stop loss / take profit for all positions."""
+    """Check and execute stop loss / take profit for all positions using intrabar extremes."""
+    if hyperliquid_trader.is_live:
+        return
     for coin in list(positions.keys()):
         symbol = [s for s, c in SYMBOL_TO_COIN.items() if c == coin][0]
         data = fetch_market_data(symbol)
         if not data:
             continue
-        
-        current_price = data['price']
+
         pos = positions[coin]
-        
-        # Check stop loss
-        if pos['side'] == 'long' and current_price <= pos['stop_loss']:
-            execute_close(coin, {'justification': 'Stop loss hit'}, current_price)
-        elif pos['side'] == 'short' and current_price >= pos['stop_loss']:
-            execute_close(coin, {'justification': 'Stop loss hit'}, current_price)
-        
-        # Check take profit
-        elif pos['side'] == 'long' and current_price >= pos['profit_target']:
-            execute_close(coin, {'justification': 'Take profit hit'}, current_price)
-        elif pos['side'] == 'short' and current_price <= pos['profit_target']:
-            execute_close(coin, {'justification': 'Take profit hit'}, current_price)
+        current_price = float(data.get("price", pos["entry_price"]))
+        candle_high = data.get("high")
+        candle_low = data.get("low")
+
+        exit_reason = None
+        exit_price = current_price
+
+        if pos["side"] == "long":
+            if candle_low is not None and candle_low <= pos["stop_loss"]:
+                exit_reason = "Stop loss hit"
+                exit_price = pos["stop_loss"]
+            elif candle_high is not None and candle_high >= pos["profit_target"]:
+                exit_reason = "Take profit hit"
+                exit_price = pos["profit_target"]
+        else:  # short
+            if candle_high is not None and candle_high >= pos["stop_loss"]:
+                exit_reason = "Stop loss hit"
+                exit_price = pos["stop_loss"]
+            elif candle_low is not None and candle_low <= pos["profit_target"]:
+                exit_reason = "Take profit hit"
+                exit_price = pos["profit_target"]
+
+        if exit_reason:
+            execute_close(coin, {"justification": exit_reason}, exit_price)
 
 # ─────────────────────────── MAIN ──────────────────────────
 
@@ -1457,6 +2053,19 @@ def main() -> None:
         logging.info("DingTalk notifications enabled.")
     else:
         logging.info("No valid ROBOT configured, notifications are disabled.")
+    if hyperliquid_trader.is_live:
+        logging.warning(
+            "Hyperliquid LIVE trading enabled. Orders will be sent to mainnet using wallet %s.",
+            hyperliquid_trader.masked_wallet,
+        )
+    else:
+        logging.info("Hyperliquid live trading disabled; running in paper mode only.")
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        logging.info("Telegram notifications enabled (chat: %s).", TELEGRAM_CHAT_ID)
+    else:
+        logging.info("Telegram notifications disabled; missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+    log_system_prompt_info("System prompt selected")
+    logging.info("LLM model configured: %s", LLM_MODEL_NAME)
     
     while True:
         try:
@@ -1475,7 +2084,8 @@ def main() -> None:
             line = f"\n{Fore.CYAN}{'='*20}"
             print(line)
             record_iteration_message(line)
-            line = f"{Fore.CYAN}Iteration {iteration_counter} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            current_dt = get_current_time()
+            line = f"{Fore.CYAN}Iteration {iteration_counter} - {current_dt.strftime('%Y-%m-%d %H:%M:%S')}"
             print(line)
             record_iteration_message(line)
             line = f"{Fore.CYAN}{'='*20}\n"
@@ -1493,150 +2103,7 @@ def main() -> None:
             if not decisions:
                 logging.warning("No decisions received from AI")
             else:
-                # Process decisions for each coin
-                for coin in SYMBOL_TO_COIN.values():
-                    if coin not in decisions:
-                        continue
-                    
-                    decision = decisions[coin]
-                    signal = decision.get('signal', 'hold')
-                    
-                    # Log AI decision
-                    log_ai_decision(
-                        coin,
-                        signal,
-                        decision.get('justification', ''),
-                        decision.get('confidence', 0)
-                    )
-                    
-                    # Get current price
-                    symbol = [s for s, c in SYMBOL_TO_COIN.items() if c == coin][0]
-                    data = fetch_market_data(symbol)
-                    if not data:
-                        continue
-                    
-                    current_price = data['price']
-                    
-                    # Execute decision
-                    if signal == 'entry':
-                        execute_entry(coin, decision, current_price)
-                    elif signal == 'close':
-                        execute_close(coin, decision, current_price)
-                    elif signal == 'hold':
-                        if coin in positions:
-                            pos = positions[coin]
-                            raw_reason = str(decision.get('justification', '')).strip()
-                            if raw_reason:
-                                reason_text = " ".join(raw_reason.split())
-                                pos['last_justification'] = reason_text
-                            else:
-                                existing_reason = str(pos.get('last_justification', '')).strip()
-                                reason_text = existing_reason or "No justification provided."
-                                if not existing_reason:
-                                    pos['last_justification'] = reason_text
-                            try:
-                                quantity = float(pos.get('quantity', 0.0))
-                            except (TypeError, ValueError):
-                                quantity = 0.0
-                            try:
-                                fees_paid = float(pos.get('fees_paid', 0.0))
-                            except (TypeError, ValueError):
-                                fees_paid = 0.0
-                            try:
-                                entry_price = float(pos.get('entry_price', 0.0))
-                            except (TypeError, ValueError):
-                                entry_price = 0.0
-                            try:
-                                target_price = float(pos.get('profit_target', entry_price))
-                            except (TypeError, ValueError):
-                                target_price = entry_price
-                            try:
-                                stop_price = float(pos.get('stop_loss', entry_price))
-                            except (TypeError, ValueError):
-                                stop_price = entry_price
-                            leverage_display = format_leverage_display(pos.get('leverage', 1.0))
-                            try:
-                                margin_value = float(pos.get('margin', 0.0))
-                            except (TypeError, ValueError):
-                                margin_value = 0.0
-                            try:
-                                risk_value = float(pos.get('risk_usd', 0.0))
-                            except (TypeError, ValueError):
-                                risk_value = 0.0
-
-                            gross_unrealized = calculate_unrealized_pnl(coin, current_price)
-                            estimated_exit_fee_now = estimate_exit_fee(pos, current_price)
-                            total_fees_now = fees_paid + estimated_exit_fee_now
-                            net_unrealized = gross_unrealized - total_fees_now
-
-                            gross_at_target = calculate_pnl_for_price(pos, target_price)
-                            exit_fee_target = estimate_exit_fee(pos, target_price)
-                            net_at_target = gross_at_target - (fees_paid + exit_fee_target)
-
-                            gross_at_stop = calculate_pnl_for_price(pos, stop_price)
-                            exit_fee_stop = estimate_exit_fee(pos, stop_price)
-                            net_at_stop = gross_at_stop - (fees_paid + exit_fee_stop)
-
-                            expected_reward = max(gross_at_target, 0.0)
-                            expected_risk = max(-gross_at_stop, 0.0)
-                            if expected_risk > 0:
-                                rr_value = expected_reward / expected_risk if expected_reward > 0 else 0.0
-                                rr_display = f"{rr_value:.2f}:1"
-                            else:
-                                rr_display = "n/a"
-
-                            pnl_color = Fore.GREEN if net_unrealized >= 0 else Fore.RED
-                            net_sign = '+' if net_unrealized >= 0 else '-'
-                            net_display = f"{net_sign}${abs(net_unrealized):.2f}"
-                            gross_sign = '+' if gross_unrealized >= 0 else '-'
-                            gross_display = f"{gross_sign}${abs(gross_unrealized):.2f}"
-
-                            gross_target_sign = '+' if gross_at_target >= 0 else '-'
-                            gross_target_display = f"{gross_target_sign}${abs(gross_at_target):.2f}"
-                            gross_stop_sign = '+' if gross_at_stop >= 0 else '-'
-                            gross_stop_display = f"{gross_stop_sign}${abs(gross_at_stop):.2f}"
-
-                            net_target_sign = '+' if net_at_target >= 0 else '-'
-                            net_target_display = f"{net_target_sign}${abs(net_at_target):.2f}"
-                            net_stop_sign = '+' if net_at_stop >= 0 else '-'
-                            net_stop_display = f"{net_stop_sign}${abs(net_at_stop):.2f}"
-
-                            line = (
-                                f"[HOLD] {coin} {pos['side'].upper()} {leverage_display} @ ${entry_price:.4f} | "
-                                f"Current: ${current_price:.4f}"
-                            )
-                            print(line)
-                            record_iteration_message(line)
-                            line = f"  ├─ Size: {quantity:.4f} {coin} | Margin: ${margin_value:.2f}"
-                            print(line)
-                            record_iteration_message(line)
-                            line = f"  ├─ TP: ${target_price:.4f} | SL: ${stop_price:.4f}"
-                            print(line)
-                            record_iteration_message(line)
-                            line = (
-                                f"  ├─ PnL: {pnl_color}{net_display}{Style.RESET_ALL} "
-                                f"(Gross: {gross_display}, Fees: ${total_fees_now:.2f})"
-                            )
-                            print(line)
-                            record_iteration_message(line)
-                            line = (
-                                f"  ├─ PnL @ Target: {gross_target_display} "
-                                f"(Net: {net_target_display})"
-                            )
-                            print(line)
-                            record_iteration_message(line)
-                            line = (
-                                f"  ├─ PnL @ Stop: {gross_stop_display} "
-                                f"(Net: {net_stop_display})"
-                            )
-                            print(line)
-                            record_iteration_message(line)
-                            line = f"  ├─ Reward/Risk: {rr_display}"
-                            print(line)
-                            record_iteration_message(line)
-                            line = f"  └─ Reason: {reason_text}"
-                            print(line)
-                            record_iteration_message(line)
+                process_ai_decisions(decisions)
             
             # Display portfolio summary
             total_equity = calculate_total_equity()

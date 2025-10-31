@@ -5,3 +5,5 @@ requests==2.31.0
 python-dotenv==1.0.0
 colorama==0.4.6
 streamlit==1.38.0
+hyperliquid-python-sdk>=0.9.0
+eth-account>=0.10.0
