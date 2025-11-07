@@ -5,6 +5,7 @@ portfolio_state.csv
 trade_history.csv
 ai_messages.csv
 portfolio_state.json
+backtest_results.json
 .DS_Store
 patreon/
 data-backtest/
