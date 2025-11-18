@@ -37,12 +37,39 @@ The Streamlit dashboard provides real-time monitoring of the trading bot's perfo
 ### DeepSeek Trading Bot Console
 ![DeepSeek Trading Bot Console](examples/screenshot.png)
 
-## How It Works
-- Every three minutes the bot fetches fresh candles for `ETH`, `SOL`, `XRP`, `BTC`, `DOGE`, and `BNB`, updates EMA/RSI/MACD indicators, and snapshots current positions.
-- The snapshot is turned into a detailed DeepSeek prompt that includes balances, unrealised PnL, open orders, and indicator values.
-- A trading rules system prompt (see below) is sent alongside the user prompt so the model always receives the risk framework before making decisions.
-- DeepSeek replies with JSON decisions (`hold`, `entry`, or `close`) per asset. The bot enforces position sizing, places entries/closes, and persists results.
-- Portfolio state, trade history, AI requests/responses, and per-iteration console transcripts are written to `data/` for later inspection or dashboard visualisation.
+## How It Works (Multi-Timeframe System)
+
+### Timeframe Analysis
+The bot uses a hierarchical 3-timeframe approach:
+
+- **15-Minute (Execution)**: Precise entry timing, RSI14, MACD crossovers
+- **1-Hour (Structure)**: Swing highs/lows, pullback identification, support/resistance
+- **4-Hour (Trend)**: Overall bias (bullish/bearish/neutral), major EMAs, ATR for stops
+
+### Trading Loop (Every 15 minutes)
+1. **Fetch Market Data**: Retrieves 200× 15m candles, 100× 1h candles, 100× 4h candles
+2. **Calculate Indicators**: EMA 20/50/200, RSI14, MACD, ATR, volume analysis
+3. **Build Rich Prompt**: Formats multi-timeframe data with clear hierarchy
+4. **AI Decision**: DeepSeek analyzes using system prompt rules
+5. **Execute Trades**: Validates AI decisions against risk management rules
+6. **Monitor Positions**: Checks for stop loss, take profit, or structural breaks
+
+### Entry Types
+- **Type A (With-Trend)**: 4H trend + 1H pullback + 15M reversal signal (2% risk)
+- **Type B (Counter-Trend)**: 4H extreme RSI + major level + strong reversal (1% risk)
+- **Type C (Range)**: Neutral 4H market, trade swing_high/swing_low (1% risk)
+
+### Exit Rules
+Positions close ONLY when:
+1. Stop loss or take profit is hit
+2. 1H structure breaks (closes beyond swing_high/swing_low)
+3. 4H major trend reverses (closes beyond EMA50 + MACD flip)
+4. Within 20% of stop loss distance = **DO NOT manually close** (let SL work)
+
+### What Changed from 3m System
+- ❌ Removed: 3-minute noise, RSI7, subjective "weak momentum" exits
+- ✅ Added: 1-hour structure layer, mechanical exit rules, 20% proximity rule
+- ✅ Improved: Clearer timeframe hierarchy, confluence requirements, risk scaling by trade type
 
 ## System Prompt & Decision Contract
 DeepSeek is primed with a risk-first system prompt that stresses:
@@ -75,7 +102,15 @@ If DeepSeek responds with `hold`, the bot still records unrealised PnL, accumula
 Need to iterate on the playbook? Set `TRADEBOT_SYSTEM_PROMPT` directly in `.env`, or point `TRADEBOT_SYSTEM_PROMPT_FILE` at a text file to swap the default rules. The backtester honours `BACKTEST_SYSTEM_PROMPT` and `BACKTEST_SYSTEM_PROMPT_FILE` so you can trial alternative prompts without touching live settings.
 
 ## Telegram Notifications
-Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` to receive a message after every iteration. The notification mirrors the console output (positions opened/closed, portfolio summary, and any warnings) so you can follow progress without tailing logs. Leave the variables empty to run without Telegram.
+Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` to receive a message after every iteration. The notification mirrors the console output (positions opened/closed, portfolio summary, and any warnings) so you can follow progress without tailing logs.
+
+Additionally you can set a dedicated signals group for trade-entry/exit signals using `TELEGRAM_SIGNALS_CHAT_ID`. When this is set the bot will send rich, Markdown-formatted ENTRY and CLOSE signals (only) to that chat — these messages include:
+- **ENTRY signals**: Asset, direction, leverage, entry price, position size, margin, risk, profit targets, stop-loss levels, R/R ratio, liquidity type, confidence percentage, entry fees, and AI reasoning
+- **CLOSE signals**: Asset, direction, size, entry/exit prices, price change %, gross/net P&L, fees paid, ROI %, updated balance, and exit reasoning
+
+The signals use emojis (🟢 for LONG, 🔴 for SHORT, ✅ for profit, ❌ for loss) and structured Markdown formatting for easy reading on mobile devices. If `TELEGRAM_SIGNALS_CHAT_ID` is not set, ENTRY/CLOSE signals will not be sent to a separate group (the general `TELEGRAM_CHAT_ID` remains used for iteration summaries and errors).
+
+Leave the variables empty to run without Telegram.
 
 ## Performance Metrics
 

@@ -38,8 +38,9 @@ KLINE_COLUMNS: List[str] = [
     "ignore",
 ]
 
-DEFAULT_INTERVAL = "3m"
+DEFAULT_INTERVAL = "15m"
 LONG_CONTEXT_INTERVAL = "4h"
+STRUCTURE_INTERVAL = "1h"
 INTERVAL_TO_DELTA = {
     "1m": timedelta(minutes=1),
     "3m": timedelta(minutes=3),
@@ -57,7 +58,7 @@ INTERVAL_TO_DELTA = {
 SUPPORTED_INTERVALS = tuple(INTERVAL_TO_DELTA.keys())
 WARMUP_BARS = {
     "1m": 500,
-    DEFAULT_INTERVAL: 300,
+    "3m": 300,
     "5m": 240,
     "15m": 200,
     "30m": 180,
@@ -481,7 +482,7 @@ def main() -> None:
     api_secret = os.getenv("BN_SECRET") or None
     binance_client = Client(api_key, api_secret, testnet=False)
 
-    intervals_needed = {cfg.interval, LONG_CONTEXT_INTERVAL}
+    intervals_needed = {cfg.interval, STRUCTURE_INTERVAL, LONG_CONTEXT_INTERVAL}
     symbol_frames: Dict[str, Dict[str, pd.DataFrame]] = {}
     for symbol in bot.SYMBOLS:
         symbol_frames[symbol] = {}

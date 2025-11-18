@@ -12,7 +12,7 @@ import json
 import logging
 import csv
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from decimal import Decimal
 from pathlib import Path
 
@@ -108,6 +108,7 @@ API_SECRET = os.getenv("BN_SECRET", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_SIGNALS_CHAT_ID = os.getenv("TELEGRAM_SIGNALS_CHAT_ID", "")
 
 HYPERLIQUID_LIVE_TRADING = _parse_bool_env(
     os.getenv("HYPERLIQUID_LIVE_TRADING"),
@@ -230,7 +231,7 @@ def describe_system_prompt_source() -> str:
 
 TRADING_RULES_PROMPT = _load_system_prompt()
 
-DEFAULT_INTERVAL = "3m"
+DEFAULT_INTERVAL = "15m"
 _INTERVAL_TO_SECONDS = {
     "1m": 60,
     "3m": 180,
@@ -602,31 +603,73 @@ def strip_ansi_codes(text: str) -> str:
     """Remove ANSI color codes so Telegram receives plain text."""
     return ANSI_ESCAPE_RE.sub("", text)
 
+def escape_markdown(text: str) -> str:
+    """Escape characters that have special meaning in Telegram Markdown."""
+    if not text:
+        return text
+    specials = r"_*[]()~`>#+-=|{}.!\\"
+    return "".join(f"\\{char}" if char in specials else char for char in text)
+
 def record_iteration_message(text: str) -> None:
     """Record console output for this iteration to share via Telegram."""
     if current_iteration_messages is not None:
         current_iteration_messages.append(strip_ansi_codes(text).rstrip())
 
-def send_telegram_message(text: str) -> None:
-    """Send a notification message to Telegram if credentials are configured."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram_message(text: str, chat_id: Optional[str] = None, parse_mode: Optional[str] = "Markdown") -> None:
+    """Send a notification message to Telegram if credentials are configured.
+
+    If `chat_id` is provided it will be used; otherwise `TELEGRAM_CHAT_ID` is used.
+    This allows sending different message types to a dedicated signals group (`TELEGRAM_SIGNALS_CHAT_ID`).
+    """
+    effective_chat = (chat_id or TELEGRAM_CHAT_ID or "").strip()
+    if not TELEGRAM_BOT_TOKEN or not effective_chat:
         return
 
     try:
+        payload = {
+            "chat_id": effective_chat,
+            "text": text,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        
         response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-            },
+            json=payload,
             timeout=10,
         )
-        if response.status_code != 200:
-            logging.warning(
-                "Telegram notification failed (%s): %s",
-                response.status_code,
-                response.text,
-            )
+        if response.status_code == 200:
+            return
+
+        response_text_lower = response.text.lower()
+        logging.warning(
+            "Telegram notification failed (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        if (
+            response.status_code == 400
+            and "can't parse entities" in response_text_lower
+            and parse_mode
+        ):
+            fallback_payload = {
+                "chat_id": effective_chat,
+                "text": strip_ansi_codes(text),
+            }
+            try:
+                fallback_response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json=fallback_payload,
+                    timeout=10,
+                )
+                if fallback_response.status_code != 200:
+                    logging.warning(
+                        "Telegram fallback notification failed (%s): %s",
+                        fallback_response.status_code,
+                        fallback_response.text,
+                    )
+            except Exception as fallback_exc:
+                logging.error("Fallback Telegram message failed: %s", fallback_exc)
     except Exception as exc:
         logging.error("Error sending Telegram message: %s", exc)
         
@@ -645,7 +688,7 @@ def notify_error(
         content=message,
         metadata=metadata,
     )
-    send_telegram_message(message)
+    send_telegram_message(message, parse_mode=None)
 
 # ───────────────────────── STATE MGMT ───────────────────────
 
@@ -935,9 +978,9 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        intraday_klines = binance_client.get_klines(symbol=symbol, interval=INTERVAL, limit=200)
-        df_intraday = pd.DataFrame(
-            intraday_klines,
+        execution_klines = binance_client.get_klines(symbol=symbol, interval=INTERVAL, limit=200)
+        df_execution = pd.DataFrame(
+            execution_klines,
             columns=[
                 "timestamp",
                 "open",
@@ -953,22 +996,23 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "ignore",
             ],
         )
-        if df_intraday.empty:
-            logging.warning("Skipping market snapshot for %s: intraday klines unavailable.", symbol)
+        if df_execution.empty:
+            logging.warning("Skipping market snapshot for %s: execution klines unavailable.", symbol)
             return None
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
-        df_intraday[numeric_cols] = df_intraday[numeric_cols].astype(float)
-        df_intraday["mid_price"] = (df_intraday["high"] + df_intraday["low"]) / 2
-        df_intraday = add_indicator_columns(
-            df_intraday,
+        df_execution[numeric_cols] = df_execution[numeric_cols].astype(float)
+        df_execution["mid_price"] = (df_execution["high"] + df_execution["low"]) / 2
+        df_execution = add_indicator_columns(
+            df_execution,
             ema_lengths=(EMA_LEN,),
-            rsi_periods=(7, RSI_LEN),
+            rsi_periods=(RSI_LEN,),
             macd_params=(MACD_FAST, MACD_SLOW, MACD_SIGNAL),
         )
 
-        df_long = pd.DataFrame(
-            binance_client.get_klines(symbol=symbol, interval="4h", limit=200),
+        structure_klines = binance_client.get_klines(symbol=symbol, interval="1h", limit=100)
+        df_structure = pd.DataFrame(
+            structure_klines,
             columns=[
                 "timestamp",
                 "open",
@@ -984,18 +1028,51 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "ignore",
             ],
         )
-        if df_long.empty:
-            logging.warning("Skipping market snapshot for %s: long-term klines unavailable.", symbol)
+        if df_structure.empty:
+            logging.warning("Skipping market snapshot for %s: structure klines unavailable.", symbol)
             return None
-        df_long[numeric_cols] = df_long[numeric_cols].astype(float)
-        df_long = add_indicator_columns(
-            df_long,
+        df_structure[numeric_cols] = df_structure[numeric_cols].astype(float)
+        df_structure = add_indicator_columns(
+            df_structure,
             ema_lengths=(20, 50),
             rsi_periods=(14,),
             macd_params=(MACD_FAST, MACD_SLOW, MACD_SIGNAL),
         )
-        df_long["atr3"] = calculate_atr_series(df_long, 3)
-        df_long["atr14"] = calculate_atr_series(df_long, 14)
+        df_structure["swing_high"] = df_structure["high"].rolling(window=5, center=True).max()
+        df_structure["swing_low"] = df_structure["low"].rolling(window=5, center=True).min()
+        df_structure["volume_sma"] = df_structure["volume"].rolling(window=20).mean()
+        df_structure["volume_ratio"] = df_structure["volume"] / df_structure["volume_sma"].replace(0, np.nan)
+
+        trend_klines = binance_client.get_klines(symbol=symbol, interval="4h", limit=100)
+        df_trend = pd.DataFrame(
+            trend_klines,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_volume",
+                "trades",
+                "taker_base",
+                "taker_quote",
+                "ignore",
+            ],
+        )
+        if df_trend.empty:
+            logging.warning("Skipping market snapshot for %s: trend klines unavailable.", symbol)
+            return None
+        df_trend[numeric_cols] = df_trend[numeric_cols].astype(float)
+        df_trend = add_indicator_columns(
+            df_trend,
+            ema_lengths=(20, 50, 200),
+            rsi_periods=(14,),
+            macd_params=(MACD_FAST, MACD_SLOW, MACD_SIGNAL),
+        )
+        df_trend["macd_histogram"] = df_trend["macd"] - df_trend["macd_signal"]
+        df_trend["atr"] = calculate_atr_series(df_trend, 14)
 
         try:
             oi_hist = binance_client.futures_open_interest_hist(symbol=symbol, period="5m", limit=30)
@@ -1011,53 +1088,75 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
             logging.debug("Funding rate history unavailable for %s: %s", symbol, exc)
             funding_rates = []
 
-        price = float(df_intraday["close"].iloc[-1])
-        ema20 = float(df_intraday["ema20"].iloc[-1])
-        rsi7 = float(df_intraday["rsi7"].iloc[-1])
-        rsi14 = float(df_intraday["rsi14"].iloc[-1])
-        macd_value = float(df_intraday["macd"].iloc[-1])
         funding_latest = funding_rates[-1] if funding_rates else 0.0
+        price = float(df_execution["close"].iloc[-1])
 
-        intraday_tail = df_intraday.tail(10)
-        long_tail = df_long.tail(10)
+        exec_tail = df_execution.tail(10)
+        struct_tail = df_structure.tail(10)
+        trend_tail = df_trend.tail(10)
 
         open_interest_latest = open_interest_values[-1] if open_interest_values else None
-        open_interest_average = (
-            float(np.mean(open_interest_values)) if open_interest_values else None
-        )
-        funding_average = float(np.mean(funding_rates)) if funding_rates else None
+        open_interest_average = float(np.mean(open_interest_values)) if open_interest_values else None
 
         return {
             "symbol": symbol,
             "coin": SYMBOL_TO_COIN[symbol],
             "price": price,
-            "ema20": ema20,
-            "rsi": rsi14,
-            "rsi7": rsi7,
-            "macd": macd_value,
-            "macd_signal": float(df_intraday["macd_signal"].iloc[-1]),
+            "execution": {
+                "ema20": float(df_execution["ema20"].iloc[-1]),
+                "rsi14": float(df_execution["rsi14"].iloc[-1]),
+                "macd": float(df_execution["macd"].iloc[-1]),
+                "macd_signal": float(df_execution["macd_signal"].iloc[-1]),
+                "series": {
+                    "mid_prices": round_series(exec_tail["mid_price"], 3),
+                    "ema20": round_series(exec_tail["ema20"], 3),
+                    "macd": round_series(exec_tail["macd"], 3),
+                    "rsi14": round_series(exec_tail["rsi14"], 3),
+                },
+            },
+            "structure": {
+                "ema20": float(df_structure["ema20"].iloc[-1]),
+                "ema50": float(df_structure["ema50"].iloc[-1]),
+                "rsi14": float(df_structure["rsi14"].iloc[-1]),
+                "macd": float(df_structure["macd"].iloc[-1]),
+                "macd_signal": float(df_structure["macd_signal"].iloc[-1]),
+                "swing_high": float(df_structure["swing_high"].iloc[-1]),
+                "swing_low": float(df_structure["swing_low"].iloc[-1]),
+                "volume_ratio": float(df_structure["volume_ratio"].iloc[-1]),
+                "series": {
+                    "close": round_series(struct_tail["close"], 3),
+                    "ema20": round_series(struct_tail["ema20"], 3),
+                    "ema50": round_series(struct_tail["ema50"], 3),
+                    "rsi14": round_series(struct_tail["rsi14"], 3),
+                    "macd": round_series(struct_tail["macd"], 3),
+                    "swing_high": round_series(struct_tail["swing_high"], 3),
+                    "swing_low": round_series(struct_tail["swing_low"], 3),
+                },
+            },
+            "trend": {
+                "ema20": float(df_trend["ema20"].iloc[-1]),
+                "ema50": float(df_trend["ema50"].iloc[-1]),
+                "ema200": float(df_trend["ema200"].iloc[-1]),
+                "rsi14": float(df_trend["rsi14"].iloc[-1]),
+                "macd": float(df_trend["macd"].iloc[-1]),
+                "macd_signal": float(df_trend["macd_signal"].iloc[-1]),
+                "macd_histogram": float(df_trend["macd_histogram"].iloc[-1]),
+                "atr": float(df_trend["atr"].iloc[-1]),
+                "current_volume": float(df_trend["volume"].iloc[-1]),
+                "average_volume": float(df_trend["volume"].mean()),
+                "series": {
+                    "close": round_series(trend_tail["close"], 3),
+                    "ema20": round_series(trend_tail["ema20"], 3),
+                    "ema50": round_series(trend_tail["ema50"], 3),
+                    "macd": round_series(trend_tail["macd"], 3),
+                    "rsi14": round_series(trend_tail["rsi14"], 3),
+                },
+            },
             "funding_rate": funding_latest,
             "funding_rates": funding_rates,
             "open_interest": {
                 "latest": open_interest_latest,
                 "average": open_interest_average,
-            },
-            "intraday_series": {
-                "mid_prices": round_series(intraday_tail["mid_price"], 3),
-                "ema20": round_series(intraday_tail["ema20"], 3),
-                "macd": round_series(intraday_tail["macd"], 3),
-                "rsi7": round_series(intraday_tail["rsi7"], 3),
-                "rsi14": round_series(intraday_tail["rsi14"], 3),
-            },
-            "long_term": {
-                "ema20": float(df_long["ema20"].iloc[-1]),
-                "ema50": float(df_long["ema50"].iloc[-1]),
-                "atr3": float(df_long["atr3"].iloc[-1]),
-                "atr14": float(df_long["atr14"].iloc[-1]),
-                "current_volume": float(df_long["volume"].iloc[-1]),
-                "average_volume": float(df_long["volume"].mean()),
-                "macd": round_series(long_tail["macd"], 3),
-                "rsi14": round_series(long_tail["rsi14"], 3),
             },
         }
     except Exception as exc:
@@ -1092,11 +1191,21 @@ def format_prompt_for_deepseek() -> str:
     def fmt(value: Optional[float], digits: int = 3) -> str:
         if value is None:
             return "N/A"
+        try:
+            if pd.isna(value):
+                return "N/A"
+        except TypeError:
+            pass
         return f"{value:.{digits}f}"
 
     def fmt_rate(value: Optional[float]) -> str:
         if value is None:
             return "N/A"
+        try:
+            if pd.isna(value):
+                return "N/A"
+        except TypeError:
+            pass
         return f"{value:.6g}"
 
     prompt_lines: List[str] = []
@@ -1108,10 +1217,10 @@ def format_prompt_for_deepseek() -> str:
     )
     prompt_lines.append("ALL PRICE OR SIGNAL SERIES BELOW ARE ORDERED OLDEST → NEWEST.")
     prompt_lines.append(
-        f"Timeframe note: Intraday series use {INTERVAL} candles unless a different interval is explicitly mentioned."
+        f"Timeframe note: Execution uses {INTERVAL} candles, Structure uses 1h candles, Trend uses 4h candles."
     )
     prompt_lines.append("-" * 80)
-    prompt_lines.append("CURRENT MARKET STATE FOR ALL COINS")
+    prompt_lines.append("CURRENT MARKET STATE FOR ALL COINS (Multi-Timeframe Analysis)")
 
     for symbol in SYMBOLS:
         coin = SYMBOL_TO_COIN[symbol]
@@ -1119,40 +1228,122 @@ def format_prompt_for_deepseek() -> str:
         if not data:
             continue
 
-        intraday = data["intraday_series"]
-        long_term = data["long_term"]
+        execution = data["execution"]
+        structure = data["structure"]
+        trend = data["trend"]
         open_interest = data["open_interest"]
         funding_rates = data.get("funding_rates", [])
         funding_avg_str = fmt_rate(float(np.mean(funding_rates))) if funding_rates else "N/A"
 
-        prompt_lines.append(f"{coin} MARKET SNAPSHOT")
+        prompt_lines.append(f"\n{coin} MARKET SNAPSHOT")
+        prompt_lines.append(f"Current Price: {fmt(data['price'], 3)}")
         prompt_lines.append(
-            f"- Price: {fmt(data['price'], 3)}, EMA20: {fmt(data['ema20'], 3)}, MACD: {fmt(data['macd'], 3)}, RSI(7): {fmt(data['rsi7'], 3)}"
+            f"Open Interest (latest/avg): {fmt(open_interest.get('latest'), 2)} / {fmt(open_interest.get('average'), 2)}"
         )
         prompt_lines.append(
-            f"- Open Interest (latest/avg): {fmt(open_interest.get('latest'), 2)} / {fmt(open_interest.get('average'), 2)}"
+            f"Funding Rate (latest/avg): {fmt_rate(data['funding_rate'])} / {funding_avg_str}"
+        )
+
+        prompt_lines.append(f"\n  4H TREND TIMEFRAME:")
+        prompt_lines.append(
+            f"    EMA Alignment: EMA20={fmt(trend['ema20'], 3)}, EMA50={fmt(trend['ema50'], 3)}, EMA200={fmt(trend['ema200'], 3)}"
+        )
+        ema_trend = (
+            "BULLISH"
+            if trend["ema20"] > trend["ema50"]
+            else "BEARISH"
+            if trend["ema20"] < trend["ema50"]
+            else "NEUTRAL"
+        )
+        prompt_lines.append(f"    Trend Classification: {ema_trend}")
+        prompt_lines.append(
+            f"    MACD: {fmt(trend['macd'], 3)}, Signal: {fmt(trend['macd_signal'], 3)}, Histogram: {fmt(trend['macd_histogram'], 3)}"
+        )
+        prompt_lines.append(f"    RSI14: {fmt(trend['rsi14'], 2)}")
+        prompt_lines.append(f"    ATR (for stop placement): {fmt(trend['atr'], 3)}")
+        prompt_lines.append(
+            f"    Volume: Current {fmt(trend['current_volume'], 2)}, Average {fmt(trend['average_volume'], 2)}"
         )
         prompt_lines.append(
-            f"- Funding Rate (latest/avg): {fmt_rate(data['funding_rate'])} / {funding_avg_str}"
-        )
-        prompt_lines.append("  Intraday series (3-minute, oldest → latest):")
-        prompt_lines.append(f"    mid_prices: {json.dumps(intraday['mid_prices'])}")
-        prompt_lines.append(f"    ema20: {json.dumps(intraday['ema20'])}")
-        prompt_lines.append(f"    macd: {json.dumps(intraday['macd'])}")
-        prompt_lines.append(f"    rsi7: {json.dumps(intraday['rsi7'])}")
-        prompt_lines.append(f"    rsi14: {json.dumps(intraday['rsi14'])}")
-        prompt_lines.append("  Longer-term context (4-hour timeframe):")
-        prompt_lines.append(
-            f"    EMA20 vs EMA50: {fmt(long_term['ema20'], 3)} / {fmt(long_term['ema50'], 3)}"
+            f"    4H Series (last 10): Close={json.dumps(trend['series']['close'])}"
         )
         prompt_lines.append(
-            f"    ATR3 vs ATR14: {fmt(long_term['atr3'], 3)} / {fmt(long_term['atr14'], 3)}"
+            f"                         EMA20={json.dumps(trend['series']['ema20'])}, EMA50={json.dumps(trend['series']['ema50'])}"
         )
         prompt_lines.append(
-            f"    Volume (current/average): {fmt(long_term['current_volume'], 3)} / {fmt(long_term['average_volume'], 3)}"
+            f"                         MACD={json.dumps(trend['series']['macd'])}, RSI14={json.dumps(trend['series']['rsi14'])}"
         )
-        prompt_lines.append(f"    MACD series: {json.dumps(long_term['macd'])}")
-        prompt_lines.append(f"    RSI14 series: {json.dumps(long_term['rsi14'])}")
+
+        prompt_lines.append(f"\n  1H STRUCTURE TIMEFRAME:")
+        prompt_lines.append(
+            f"    EMA20: {fmt(structure['ema20'], 3)}, EMA50: {fmt(structure['ema50'], 3)}"
+        )
+        struct_position = "above" if data["price"] > structure["ema20"] else "below"
+        prompt_lines.append(f"    Price relative to 1H EMA20: {struct_position}")
+        prompt_lines.append(
+            f"    Swing High: {fmt(structure['swing_high'], 3)}, Swing Low: {fmt(structure['swing_low'], 3)}"
+        )
+        prompt_lines.append(f"    RSI14: {fmt(structure['rsi14'], 2)}")
+        prompt_lines.append(
+            f"    MACD: {fmt(structure['macd'], 3)}, Signal: {fmt(structure['macd_signal'], 3)}"
+        )
+        prompt_lines.append(f"    Volume Ratio: {fmt(structure['volume_ratio'], 2)}x (>1.5 = volume spike)")
+        prompt_lines.append(
+            f"    1H Series (last 10): Close={json.dumps(structure['series']['close'])}"
+        )
+        prompt_lines.append(
+            f"                         EMA20={json.dumps(structure['series']['ema20'])}, EMA50={json.dumps(structure['series']['ema50'])}"
+        )
+        prompt_lines.append(
+            f"                         Swing High={json.dumps(structure['series']['swing_high'])}, Swing Low={json.dumps(structure['series']['swing_low'])}"
+        )
+        prompt_lines.append(
+            f"                         RSI14={json.dumps(structure['series']['rsi14'])}"
+        )
+
+        prompt_lines.append(f"\n  {INTERVAL.upper()} EXECUTION TIMEFRAME:")
+        prompt_lines.append(
+            f"    EMA20: {fmt(execution['ema20'], 3)} (Price {'above' if data['price'] > execution['ema20'] else 'below'} EMA20)"
+        )
+        prompt_lines.append(
+            f"    MACD: {fmt(execution['macd'], 3)}, Signal: {fmt(execution['macd_signal'], 3)}"
+        )
+        if execution["macd"] > execution["macd_signal"]:
+            macd_direction = "bullish"
+        elif execution["macd"] < execution["macd_signal"]:
+            macd_direction = "bearish"
+        else:
+            macd_direction = "neutral"
+        prompt_lines.append(f"    MACD Crossover: {macd_direction}")
+        prompt_lines.append(f"    RSI14: {fmt(execution['rsi14'], 2)}")
+        rsi_zone = (
+            "oversold (<35)"
+            if execution["rsi14"] < 35
+            else "overbought (>65)"
+            if execution["rsi14"] > 65
+            else "neutral"
+        )
+        prompt_lines.append(f"    RSI Zone: {rsi_zone}")
+        prompt_lines.append(
+            f"    {INTERVAL.upper()} Series (last 10): Mid-Price={json.dumps(execution['series']['mid_prices'])}"
+        )
+        prompt_lines.append(
+            f"                          EMA20={json.dumps(execution['series']['ema20'])}"
+        )
+        prompt_lines.append(
+            f"                          MACD={json.dumps(execution['series']['macd'])}"
+        )
+        prompt_lines.append(
+            f"                          RSI14={json.dumps(execution['series']['rsi14'])}"
+        )
+
+        prompt_lines.append(f"\n  MARKET SENTIMENT:")
+        prompt_lines.append(
+            f"    Open Interest: Latest={fmt(open_interest.get('latest'), 2)}, Average={fmt(open_interest.get('average'), 2)}"
+        )
+        prompt_lines.append(
+            f"    Funding Rate: Latest={fmt_rate(data['funding_rate'])}, Average={funding_avg_str}"
+        )
         prompt_lines.append("-" * 80)
 
     prompt_lines.append("ACCOUNT INFORMATION AND PERFORMANCE")
@@ -1219,7 +1410,7 @@ Return ONLY a valid JSON object with this structure:
     "leverage": 10,
     "confidence": 0.75,
     "risk_usd": 500.0,
-    "invalidation_condition": "If price closes below X on a 3-minute candle",
+    "invalidation_condition": "If price closes below X on a 15-minute candle",
     "justification": "Reason for entry/close/hold"
   }
 }
@@ -1233,6 +1424,77 @@ IMPORTANT:
     )
 
     return "\n".join(prompt_lines)
+
+def _recover_partial_decisions(json_str: str) -> Optional[Tuple[Dict[str, Any], List[str]]]:
+    """Attempt to salvage individual coin decisions from truncated JSON."""
+    coins = list(SYMBOL_TO_COIN.values())
+    recovered: Dict[str, Any] = {}
+    missing: List[str] = []
+
+    for coin in coins:
+        marker = f'"{coin}"'
+        marker_idx = json_str.find(marker)
+        if marker_idx == -1:
+            missing.append(coin)
+            continue
+
+        obj_start = json_str.find('{', marker_idx)
+        if obj_start == -1:
+            missing.append(coin)
+            continue
+
+        depth = 0
+        in_string = False
+        escaped = False
+        end_idx: Optional[int] = None
+
+        for idx in range(obj_start, len(json_str)):
+            char = json_str[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    end_idx = idx
+                    break
+
+        if end_idx is None:
+            missing.append(coin)
+            continue
+
+        block = json_str[obj_start:end_idx + 1]
+        try:
+            recovered[coin] = json.loads(block)
+        except json.JSONDecodeError:
+            missing.append(coin)
+
+    if not recovered:
+        return None
+
+    missing = list(dict.fromkeys(missing))
+
+    fallback_message = "Missing data from truncated AI response; defaulting to hold."
+    for coin in coins:
+        if coin not in recovered:
+            recovered[coin] = {
+                "signal": "hold",
+                "justification": fallback_message,
+                "confidence": 0.0,
+            }
+
+    return recovered, missing
+
 
 def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
     """Call OpenRouter API with DeepSeek Chat V3.1."""
@@ -1299,7 +1561,21 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
             return None
 
         result = response.json()
-        content = result['choices'][0]['message']['content']
+        choices = result.get("choices")
+        if not choices:
+            notify_error(
+                "DeepSeek API returned no choices",
+                metadata={
+                    "status_code": response.status_code,
+                    "response_text": response.text[:500],
+                },
+            )
+            return None
+
+        primary_choice = choices[0]
+        message = primary_choice.get("message") or {}
+        content = message.get("content", "") or ""
+        finish_reason = primary_choice.get("finish_reason")
 
         log_ai_message(
             direction="received",
@@ -1308,7 +1584,8 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
             metadata={
                 "status_code": response.status_code,
                 "response_id": result.get("id"),
-                "usage": result.get("usage")
+                "usage": result.get("usage"),
+                "finish_reason": finish_reason,
             }
         )
 
@@ -1321,12 +1598,41 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
                 decisions = json.loads(json_str)
                 return decisions
             except json.JSONDecodeError as decode_err:
+                recovery = _recover_partial_decisions(json_str)
+                if recovery:
+                    decisions, missing_coins = recovery
+                    if missing_coins:
+                        notification_message = (
+                            "DeepSeek response truncated; defaulted to hold for missing coins"
+                        )
+                    else:
+                        notification_message = (
+                            "DeepSeek response malformed; recovered all coin decisions"
+                        )
+                    logging.warning(
+                        "Recovered DeepSeek response after JSON error (missing coins: %s)",
+                        ", ".join(missing_coins) or "none",
+                    )
+                    notify_error(
+                        notification_message,
+                        metadata={
+                            "response_id": result.get("id"),
+                            "status_code": response.status_code,
+                            "missing_coins": missing_coins,
+                            "finish_reason": finish_reason,
+                            "raw_json_excerpt": json_str[:2000],
+                            "decode_error": str(decode_err),
+                        },
+                        log_error=False,
+                    )
+                    return decisions
                 snippet = json_str[:2000]
                 notify_error(
                     f"DeepSeek JSON decode failed: {decode_err}",
                     metadata={
                         "response_id": result.get("id"),
                         "status_code": response.status_code,
+                        "finish_reason": finish_reason,
                         "raw_json_excerpt": snippet,
                     },
                 )
@@ -1337,6 +1643,7 @@ def call_deepseek_api(prompt: str) -> Optional[Dict[str, Any]]:
                 metadata={
                     "response_id": result.get("id"),
                     "status_code": response.status_code,
+                    "finish_reason": finish_reason,
                 },
             )
             return None
@@ -1690,6 +1997,7 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     record_iteration_message(line)
     reason_text = raw_reason or "No justification provided."
     reason_text = " ".join(reason_text.split())
+    reason_text_for_signal = escape_markdown(reason_text)
 
     line = (
         f"  ├─ PnL @ Target: ${gross_at_target:+.2f} "
@@ -1733,6 +2041,47 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     print(line)
     record_iteration_message(line)
     
+    # Send rich ENTRY signal to the dedicated signals group (if configured).
+    try:
+        # Format percentage confidence
+        confidence_pct = decision.get('confidence', 0) * 100
+        
+        # Determine emoji based on side
+        side_emoji = "🟢" if side.lower() == "long" else "🔴"
+        
+        signal_text = (
+            f"{side_emoji} *ENTRY SIGNAL* {side_emoji}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"*Asset:* `{coin}`\n"
+            f"*Direction:* {side.upper()} {leverage_display}\n"
+            f"*Entry Price:* `${entry_price:.4f}`\n"
+            f"\n"
+            f"📊 *Position Details*\n"
+            f"• Size: `{quantity:.4f} {coin}`\n"
+            f"• Margin: `${margin_required:.2f}`\n"
+            f"• Risk: `${risk_usd:.2f}`\n"
+            f"\n"
+            f"🎯 *Targets & Stops*\n"
+            f"• Target: `${profit_target_price:.4f}` ({'+' if gross_at_target >= 0 else ''}`${gross_at_target:.2f}`)\n"
+            f"• Stop Loss: `${stop_loss_price:.4f}` (`${gross_at_stop:.2f}`)\n"
+            f"• R/R Ratio: `{rr_display}`\n"
+            f"\n"
+            f"⚙️ *Execution*\n"
+            f"• Liquidity: `{liquidity}`\n"
+            f"• Confidence: `{confidence_pct:.0f}%`\n"
+            f"• Entry Fee: `${entry_fee:.2f}`\n"
+            f"\n"
+            f"💭 *Reasoning*\n"
+            f"_{reason_text_for_signal}_\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {get_current_time().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        # If TELEGRAM_SIGNALS_CHAT_ID is set, prefer it; otherwise fall back to TELEGRAM_CHAT_ID
+        send_telegram_message(signal_text, chat_id=TELEGRAM_SIGNALS_CHAT_ID, parse_mode="Markdown")
+    except Exception as exc:
+        # Keep trading even if notifications fail
+        logging.debug("Failed to send ENTRY signal to Telegram (non-fatal): %s", exc)
+    
     log_trade(coin, 'ENTRY', {
         'side': side,
         'quantity': quantity,
@@ -1758,6 +2107,7 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
     raw_reason = str(decision.get('justification', '')).strip()
     reason_text = raw_reason or pos.get('last_justification') or "AI close signal"
     reason_text = " ".join(reason_text.split())
+    reason_text_for_signal = escape_markdown(reason_text)
     
     pnl = calculate_unrealized_pnl(coin, current_price)
     
@@ -1829,6 +2179,54 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
     
     del positions[coin]
     save_state()
+    
+    # Send rich CLOSE signal to the dedicated signals group (if configured).
+    try:
+        # Determine emoji based on profitability
+        if net_pnl > 0:
+            result_emoji = "✅"
+            result_label = "PROFIT"
+        elif net_pnl < 0:
+            result_emoji = "❌"
+            result_label = "LOSS"
+        else:
+            result_emoji = "➖"
+            result_label = "BREAKEVEN"
+        
+        # Calculate price change percentage
+        price_change_pct = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+        price_change_sign = "+" if price_change_pct >= 0 else ""
+        
+        # Calculate ROI on margin
+        roi_pct = (net_pnl / pos['margin']) * 100 if pos['margin'] > 0 else 0
+        roi_sign = "+" if roi_pct >= 0 else ""
+        
+        close_signal = (
+            f"{result_emoji} *CLOSE SIGNAL - {result_label}* {result_emoji}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"*Asset:* `{coin}`\n"
+            f"*Direction:* {pos['side'].upper()}\n"
+            f"*Size:* `{pos['quantity']:.4f} {coin}`\n"
+            f"\n"
+            f"💰 *P&L Summary*\n"
+            f"• Entry: `${pos['entry_price']:.4f}`\n"
+            f"• Exit: `${current_price:.4f}` ({price_change_sign}{price_change_pct:.2f}%)\n"
+            f"• Gross P&L: `${pnl:.2f}`\n"
+            f"• Fees Paid: `${total_fees:.2f}`\n"
+            f"• *Net P&L:* `${net_pnl:.2f}`\n"
+            f"• ROI: `{roi_sign}{roi_pct:.1f}%`\n"
+            f"\n"
+            f"📈 *Updated Balance*\n"
+            f"• New Balance: `${balance:.2f}`\n"
+            f"\n"
+            f"💭 *Exit Reasoning*\n"
+            f"_{reason_text_for_signal}_\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {get_current_time().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+        send_telegram_message(close_signal, chat_id=TELEGRAM_SIGNALS_CHAT_ID, parse_mode="Markdown")
+    except Exception as exc:
+        logging.debug("Failed to send CLOSE signal to Telegram (non-fatal): %s", exc)
 
 
 def process_ai_decisions(decisions: Dict[str, Any]) -> None:
@@ -2124,7 +2522,7 @@ def main() -> None:
             record_iteration_message(line)
 
             if current_iteration_messages:
-                send_telegram_message("\n".join(current_iteration_messages))
+                send_telegram_message("\n".join(current_iteration_messages), parse_mode=None)
             
             # Log state
             log_portfolio_state()
