@@ -723,6 +723,31 @@ def load_state() -> None:
                         fees_paid_value = float(fees_paid_raw)
                     except (TypeError, ValueError):
                         fees_paid_value = 0.0
+                risk_usd_raw = pos.get("risk_usd", 0.0)
+                try:
+                    risk_usd_value = float(risk_usd_raw)
+                except (TypeError, ValueError):
+                    risk_usd_value = 0.0
+                initial_stop_raw = pos.get("initial_stop", pos.get("stop_loss", 0.0))
+                try:
+                    initial_stop_value = float(initial_stop_raw)
+                except (TypeError, ValueError):
+                    initial_stop_value = float(pos.get("stop_loss", 0.0))
+                initial_risk_per_unit_raw = pos.get("initial_risk_per_unit", 0.0)
+                try:
+                    initial_risk_per_unit_value = float(initial_risk_per_unit_raw)
+                except (TypeError, ValueError):
+                    initial_risk_per_unit_value = 0.0
+                initial_risk_usd_raw = pos.get("initial_risk_usd", risk_usd_value)
+                try:
+                    initial_risk_usd_value = float(initial_risk_usd_raw)
+                except (TypeError, ValueError):
+                    initial_risk_usd_value = risk_usd_value
+                trail_history_raw = pos.get("trail_history", [])
+                trail_history_value = [
+                    hist for hist in trail_history_raw
+                    if isinstance(hist, dict)
+                ]
 
                 fee_rate_raw = pos.get("fee_rate", TAKER_FEE_RATE)
                 try:
@@ -745,6 +770,13 @@ def load_state() -> None:
                     "liquidity": pos.get("liquidity", "taker"),
                     "entry_justification": pos.get("entry_justification", ""),
                     "last_justification": pos.get("last_justification", pos.get("entry_justification", "")),
+                    "risk_usd": risk_usd_value,
+                    "trade_type": pos.get("trade_type"),
+                    "trail_phase": pos.get("trail_phase", "Phase 1"),
+                    "initial_stop": initial_stop_value,
+                    "initial_risk_per_unit": initial_risk_per_unit_value,
+                    "initial_risk_usd": initial_risk_usd_value,
+                    "trail_history": trail_history_value,
                 }
             positions = restored_positions
         logging.info(
@@ -880,6 +912,41 @@ def calculate_atr_series(df: pd.DataFrame, period: int) -> pd.Series:
     return true_range.ewm(alpha=alpha, adjust=False).mean()
 
 
+def calculate_adx_series(df: pd.DataFrame, period: int) -> pd.Series:
+    """Return Average Directional Index (ADX) series."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+
+    plus_dm = (high - prev_high).where((high - prev_high) > (prev_low - low), 0.0)
+    plus_dm = plus_dm.where(plus_dm > 0, 0.0)
+    minus_dm = (prev_low - low).where((prev_low - low) > (high - prev_high), 0.0)
+    minus_dm = minus_dm.where(minus_dm > 0, 0.0)
+
+    tr_components = pd.concat(
+        [
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ],
+        axis=1,
+    )
+    true_range = tr_components.max(axis=1)
+
+    alpha = 1 / period
+    smoothed_tr = true_range.ewm(alpha=alpha, adjust=False).mean().replace(0, np.nan)
+    smoothed_plus_dm = plus_dm.ewm(alpha=alpha, adjust=False).mean()
+    smoothed_minus_dm = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+
+    plus_di = 100 * (smoothed_plus_dm / smoothed_tr)
+    minus_di = 100 * (smoothed_minus_dm / smoothed_tr)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    return dx.ewm(alpha=alpha, adjust=False).mean()
+
+
 def calculate_indicators(df: pd.DataFrame) -> pd.Series:
     """Calculate technical indicators and return the latest row."""
     enriched = add_indicator_columns(
@@ -1009,6 +1076,7 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
             rsi_periods=(RSI_LEN,),
             macd_params=(MACD_FAST, MACD_SLOW, MACD_SIGNAL),
         )
+        df_execution["atr"] = calculate_atr_series(df_execution, 14)
 
         structure_klines = binance_client.get_klines(symbol=symbol, interval="1h", limit=100)
         df_structure = pd.DataFrame(
@@ -1038,6 +1106,7 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
             rsi_periods=(14,),
             macd_params=(MACD_FAST, MACD_SLOW, MACD_SIGNAL),
         )
+        df_structure["atr"] = calculate_atr_series(df_structure, 14)
         df_structure["swing_high"] = df_structure["high"].rolling(window=5, center=True).max()
         df_structure["swing_low"] = df_structure["low"].rolling(window=5, center=True).min()
         df_structure["volume_sma"] = df_structure["volume"].rolling(window=20).mean()
@@ -1073,6 +1142,25 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
         )
         df_trend["macd_histogram"] = df_trend["macd"] - df_trend["macd_signal"]
         df_trend["atr"] = calculate_atr_series(df_trend, 14)
+        df_trend["macd_histogram_avg"] = df_trend["macd_histogram"].abs().rolling(window=20, min_periods=5).mean()
+        df_trend["adx"] = calculate_adx_series(df_trend, 14)
+
+        latest_trend = df_trend.iloc[-1]
+        macd_hist_value = float(latest_trend["macd_histogram"])
+        macd_hist_avg = float(df_trend["macd_histogram_avg"].iloc[-1]) if not pd.isna(
+            df_trend["macd_histogram_avg"].iloc[-1]
+        ) else 0.0
+        macd_ratio = macd_hist_value / macd_hist_avg if macd_hist_avg else 0.0
+        rsi_component = (float(latest_trend["rsi14"]) - 50.0) / 50.0
+        adx_value = float(latest_trend.get("adx", 0.0))
+        adx_component = adx_value / 25.0 if adx_value else 0.0
+        ema_component = 1.0 if latest_trend["ema20"] > latest_trend["ema50"] else 0.0
+        trend_strength = (
+            ema_component * 0.30
+            + macd_ratio * 0.30
+            + rsi_component * 0.20
+            + adx_component * 0.20
+        )
 
         try:
             oi_hist = binance_client.futures_open_interest_hist(symbol=symbol, period="5m", limit=30)
@@ -1107,11 +1195,13 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "rsi14": float(df_execution["rsi14"].iloc[-1]),
                 "macd": float(df_execution["macd"].iloc[-1]),
                 "macd_signal": float(df_execution["macd_signal"].iloc[-1]),
+                "atr": float(df_execution["atr"].iloc[-1]),
                 "series": {
                     "mid_prices": round_series(exec_tail["mid_price"], 3),
                     "ema20": round_series(exec_tail["ema20"], 3),
                     "macd": round_series(exec_tail["macd"], 3),
                     "rsi14": round_series(exec_tail["rsi14"], 3),
+                    "atr": round_series(exec_tail["atr"], 3),
                 },
             },
             "structure": {
@@ -1123,6 +1213,7 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "swing_high": float(df_structure["swing_high"].iloc[-1]),
                 "swing_low": float(df_structure["swing_low"].iloc[-1]),
                 "volume_ratio": float(df_structure["volume_ratio"].iloc[-1]),
+                "atr": float(df_structure["atr"].iloc[-1]),
                 "series": {
                     "close": round_series(struct_tail["close"], 3),
                     "ema20": round_series(struct_tail["ema20"], 3),
@@ -1131,6 +1222,7 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                     "macd": round_series(struct_tail["macd"], 3),
                     "swing_high": round_series(struct_tail["swing_high"], 3),
                     "swing_low": round_series(struct_tail["swing_low"], 3),
+                    "atr": round_series(struct_tail["atr"], 3),
                 },
             },
             "trend": {
@@ -1142,6 +1234,11 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                 "macd_signal": float(df_trend["macd_signal"].iloc[-1]),
                 "macd_histogram": float(df_trend["macd_histogram"].iloc[-1]),
                 "atr": float(df_trend["atr"].iloc[-1]),
+                "macd_histogram_avg": float(df_trend["macd_histogram_avg"].iloc[-1]) if not pd.isna(
+                    df_trend["macd_histogram_avg"].iloc[-1]
+                ) else 0.0,
+                "adx": float(df_trend["adx"].iloc[-1]) if not pd.isna(df_trend["adx"].iloc[-1]) else 0.0,
+                "trend_strength": float(trend_strength),
                 "current_volume": float(df_trend["volume"].iloc[-1]),
                 "average_volume": float(df_trend["volume"].mean()),
                 "series": {
@@ -1150,6 +1247,8 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
                     "ema50": round_series(trend_tail["ema50"], 3),
                     "macd": round_series(trend_tail["macd"], 3),
                     "rsi14": round_series(trend_tail["rsi14"], 3),
+                    "macd_histogram": round_series(trend_tail["macd_histogram"], 3),
+                    "adx": round_series(trend_tail["adx"], 3),
                 },
             },
             "funding_rate": funding_latest,
@@ -1157,6 +1256,13 @@ def collect_prompt_market_data(symbol: str) -> Optional[Dict[str, Any]]:
             "open_interest": {
                 "latest": open_interest_latest,
                 "average": open_interest_average,
+            },
+            "trend_strength": float(trend_strength),
+            "trend_components": {
+                "ema_component": float(ema_component),
+                "macd_ratio": float(macd_ratio),
+                "rsi_component": float(rsi_component),
+                "adx_component": float(adx_component),
             },
         }
     except Exception as exc:
@@ -1231,6 +1337,7 @@ def format_prompt_for_deepseek() -> str:
         execution = data["execution"]
         structure = data["structure"]
         trend = data["trend"]
+        trend_components = data.get("trend_components", {})
         open_interest = data["open_interest"]
         funding_rates = data.get("funding_rates", [])
         funding_avg_str = fmt_rate(float(np.mean(funding_rates))) if funding_rates else "N/A"
@@ -1259,8 +1366,19 @@ def format_prompt_for_deepseek() -> str:
         prompt_lines.append(
             f"    MACD: {fmt(trend['macd'], 3)}, Signal: {fmt(trend['macd_signal'], 3)}, Histogram: {fmt(trend['macd_histogram'], 3)}"
         )
+        prompt_lines.append(
+            f"    MACD Histogram Avg (|20|): {fmt(trend.get('macd_histogram_avg'), 3)}"
+        )
         prompt_lines.append(f"    RSI14: {fmt(trend['rsi14'], 2)}")
-        prompt_lines.append(f"    ATR (for stop placement): {fmt(trend['atr'], 3)}")
+        prompt_lines.append(f"    ATR14: {fmt(trend['atr'], 3)}")
+        prompt_lines.append(f"    ADX14: {fmt(trend.get('adx'), 2)}")
+        prompt_lines.append(
+            f"    Trend Strength Score: {fmt(trend.get('trend_strength'), 2)} "
+            f"(EMA {fmt(trend_components.get('ema_component'), 2)}, "
+            f"MACD ratio {fmt(trend_components.get('macd_ratio'), 2)}, "
+            f"RSI {fmt(trend_components.get('rsi_component'), 2)}, "
+            f"ADX {fmt(trend_components.get('adx_component'), 2)})"
+        )
         prompt_lines.append(
             f"    Volume: Current {fmt(trend['current_volume'], 2)}, Average {fmt(trend['average_volume'], 2)}"
         )
@@ -1287,6 +1405,7 @@ def format_prompt_for_deepseek() -> str:
         prompt_lines.append(
             f"    MACD: {fmt(structure['macd'], 3)}, Signal: {fmt(structure['macd_signal'], 3)}"
         )
+        prompt_lines.append(f"    ATR14: {fmt(structure['atr'], 3)}")
         prompt_lines.append(f"    Volume Ratio: {fmt(structure['volume_ratio'], 2)}x (>1.5 = volume spike)")
         prompt_lines.append(
             f"    1H Series (last 10): Close={json.dumps(structure['series']['close'])}"
@@ -1299,6 +1418,9 @@ def format_prompt_for_deepseek() -> str:
         )
         prompt_lines.append(
             f"                         RSI14={json.dumps(structure['series']['rsi14'])}"
+        )
+        prompt_lines.append(
+            f"                         ATR14={json.dumps(structure['series']['atr'])}"
         )
 
         prompt_lines.append(f"\n  {INTERVAL.upper()} EXECUTION TIMEFRAME:")
@@ -1324,6 +1446,7 @@ def format_prompt_for_deepseek() -> str:
             else "neutral"
         )
         prompt_lines.append(f"    RSI Zone: {rsi_zone}")
+        prompt_lines.append(f"    ATR14: {fmt(execution['atr'], 3)}")
         prompt_lines.append(
             f"    {INTERVAL.upper()} Series (last 10): Mid-Price={json.dumps(execution['series']['mid_prices'])}"
         )
@@ -1335,6 +1458,9 @@ def format_prompt_for_deepseek() -> str:
         )
         prompt_lines.append(
             f"                          RSI14={json.dumps(execution['series']['rsi14'])}"
+        )
+        prompt_lines.append(
+            f"                          ATR14={json.dumps(execution['series']['atr'])}"
         )
 
         prompt_lines.append(f"\n  MARKET SENTIMENT:")
@@ -1364,6 +1490,19 @@ def format_prompt_for_deepseek() -> str:
         else:
             liquidation_price = pos["entry_price"] * (1 + 1 / leverage)
         notional_value = quantity * current_price
+        initial_stop = pos.get("initial_stop", pos.get("stop_loss"))
+        initial_risk_per_unit = float(pos.get("initial_risk_per_unit", 0.0) or 0.0)
+        if initial_risk_per_unit:
+            if pos["side"] == "long":
+                r_multiple = (current_price - pos["entry_price"]) / initial_risk_per_unit
+            else:
+                r_multiple = (pos["entry_price"] - current_price) / initial_risk_per_unit
+        else:
+            r_multiple = 0.0
+        snapshot = market_snapshots.get(coin, {})
+        execution = snapshot.get("execution", {})
+        structure = snapshot.get("structure", {})
+        trend = snapshot.get("trend", {})
         position_payload = {
             "symbol": coin,
             "side": pos["side"],
@@ -1373,6 +1512,12 @@ def format_prompt_for_deepseek() -> str:
             "liquidation_price": liquidation_price,
             "unrealized_pnl": gross_unrealized,
             "leverage": pos.get("leverage", 1),
+            "trade_type": pos.get("trade_type"),
+            "trail_phase": pos.get("trail_phase", "Phase 1"),
+            "initial_stop": initial_stop,
+            "initial_risk_per_unit": initial_risk_per_unit,
+            "initial_risk_usd": pos.get("initial_risk_usd"),
+            "current_r_multiple": r_multiple,
             "exit_plan": {
                 "profit_target": pos.get("profit_target"),
                 "stop_loss": pos.get("stop_loss"),
@@ -1385,6 +1530,16 @@ def format_prompt_for_deepseek() -> str:
             "wait_for_fill": pos.get("wait_for_fill", False),
             "entry_oid": pos.get("entry_oid", -1),
             "notional_usd": notional_value,
+            "prompt_metrics": {
+                "atr_15m": execution.get("atr"),
+                "atr_1h": structure.get("atr"),
+                "atr_4h": trend.get("atr"),
+                "ema20_15m": execution.get("ema20"),
+                "ema20_1h": structure.get("ema20"),
+                "ema20_4h": trend.get("ema20"),
+                "trend_strength": snapshot.get("trend_strength"),
+            },
+            "trail_history_tail": pos.get("trail_history", [])[-5:],
         }
         prompt_lines.append(f"{coin} position data: {json.dumps(position_payload)}")
 
@@ -1394,32 +1549,25 @@ def format_prompt_for_deepseek() -> str:
     prompt_lines.append(
         """
 INSTRUCTIONS:
-For each coin, provide a trading decision in JSON format. You can either:
-1. "hold" - Keep current position (if you have one)
-2. "entry" - Open a new position (if you don't have one)
-3. "close" - Close current position
-
-Return ONLY a valid JSON object with this structure:
+Return ONLY valid JSON (no extra text). For each coin supply:
 {
-  "ETH": {
-    "signal": "hold|entry|close",
-    "side": "long|short",  // only for entry
+  "BNB": {
+    "signal": "entry|hold|close",
+    "side": "long|short",              // required for entry
     "quantity": 0.0,
     "profit_target": 0.0,
     "stop_loss": 0.0,
-    "leverage": 10,
+    "leverage": 3,
     "confidence": 0.75,
-    "risk_usd": 500.0,
-    "invalidation_condition": "If price closes below X on a 15-minute candle",
-    "justification": "Reason for entry/close/hold"
+    "risk_usd": 150.0,
+    "invalidation_condition": "1H close below 1080",
+    "trade_type": "TYPE A|TYPE B|TYPE C",
+    "phase": "Phase 1|Phase 2|Phase 3|Phase 4",
+    "justification": "Concise multi-timeframe reasoning with rule references."
   }
 }
-
-IMPORTANT:
-- Only suggest entries if you see strong opportunities
-- Use proper risk management
-- Provide clear invalidation conditions
-- Return ONLY valid JSON, no other text
+Optional for partial closes: include "close_fraction" (0-1), "close_percent", or "close_quantity" for the amount to exit.
+Do not include commentary outside the JSON response.
 """.strip()
     )
 
@@ -1834,6 +1982,14 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         logging.warning(f"{coin}: Invalid risk_usd '%s'; defaulting to 1%% of balance.", risk_usd_raw)
         risk_usd = balance * 0.01
 
+    if not np.isfinite(risk_usd) or risk_usd <= 0:
+        logging.warning(
+            "%s: Received non-positive risk (%s); skipping entry to avoid zero-sized trade.",
+            coin,
+            risk_usd_raw,
+        )
+        return
+
     try:
         stop_loss_price = float(decision['stop_loss'])
         profit_target_price = float(decision['profit_target'])
@@ -1886,11 +2042,20 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     
     # Calculate position size based on risk
     stop_distance = abs(current_price - stop_loss_price)
-    if stop_distance == 0:
-        logging.warning(f"{coin}: Invalid stop loss, skipping")
+    if not np.isfinite(stop_distance) or stop_distance <= 0:
+        logging.warning(f"{coin}: Invalid stop loss distance; skipping entry.")
         return
     
     quantity = risk_usd / stop_distance
+    if not np.isfinite(quantity) or quantity <= 0:
+        logging.warning(
+            "%s: Computed invalid position size (risk=%s, distance=%s); skipping entry.",
+            coin,
+            risk_usd,
+            stop_distance,
+        )
+        return
+
     position_value = quantity * current_price
     margin_required = position_value / leverage if leverage else position_value
     
@@ -1935,6 +2100,12 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
             return
     
     # Open position
+    trade_type_raw = str(decision.get("trade_type", "TYPE A")).strip().upper()
+    trade_type = trade_type_raw or "TYPE A"
+    phase_raw = str(decision.get("phase", "Phase 1")).strip()
+    trail_phase = phase_raw if phase_raw else "Phase 1"
+    now_iso = get_current_time().isoformat()
+
     positions[coin] = {
         'side': side,
         'quantity': quantity,
@@ -1949,6 +2120,19 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         'fee_rate': fee_rate,
         'liquidity': liquidity,
         'risk_usd': risk_usd,
+        'trade_type': trade_type,
+        'trail_phase': trail_phase,
+        'initial_stop': stop_loss_price,
+        'initial_risk_per_unit': stop_distance,
+        'initial_risk_usd': risk_usd,
+        'trail_history': [
+            {
+                "timestamp": now_iso,
+                "phase": trail_phase,
+                "stop_loss": stop_loss_price,
+                "reason": "Initial stop",
+            }
+        ],
         'wait_for_fill': decision.get('wait_for_fill', False),
         'entry_oid': decision.get('entry_oid', -1),
         'tp_oid': decision.get('tp_oid', -1),
@@ -1992,7 +2176,7 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
     line = f"  ├─ Risk: ${risk_usd:.2f} | Liquidity: {liquidity}"
     print(line)
     record_iteration_message(line)
-    line = f"  ├─ Target: ${target_price:.4f} | Stop: ${stop_price:.4f}"
+    line = f"  ├─ Target: ${target_price:.4f} | Stop: ${stop_price:.4f} | {trade_type} {trail_phase}"
     print(line)
     record_iteration_message(line)
     reason_text = raw_reason or "No justification provided."
@@ -2090,38 +2274,109 @@ def execute_entry(coin: str, decision: Dict[str, Any], current_price: float) -> 
         'stop_loss': decision['stop_loss'],
         'leverage': leverage,
         'confidence': decision.get('confidence', 0),
+        'trade_type': trade_type,
+        'phase': trail_phase,
         'pnl': 0,
-        'reason': f"{reason_text or 'AI entry signal'} | Fees: ${entry_fee:.2f}"
+        'reason': f"{reason_text or 'AI entry signal'} | {trade_type} {trail_phase} | Fees: ${entry_fee:.2f}"
     })
     save_state()
 
 def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> None:
-    """Execute close trade."""
+    """Execute full or partial close."""
     global balance
-    
+
     if coin not in positions:
         logging.warning(f"{coin}: No position to close")
         return
-    
+
     pos = positions[coin]
-    raw_reason = str(decision.get('justification', '')).strip()
-    reason_text = raw_reason or pos.get('last_justification') or "AI close signal"
+    original_quantity = float(pos.get("quantity", 0.0))
+    if original_quantity <= 0:
+        logging.warning(f"{coin}: Position quantity is non-positive; skipping close.")
+        return
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    # Determine requested close size
+    close_quantity = None
+    quantity_override = decision.get("close_quantity")
+    if quantity_override is None:
+        quantity_override = decision.get("quantity")
+    qty_value = _to_float(quantity_override)
+    if qty_value is not None and qty_value > 0:
+        close_quantity = qty_value
+
+    if close_quantity is None:
+        fraction = _to_float(decision.get("close_fraction"))
+        if fraction is None:
+            percent = _to_float(decision.get("close_percent"))
+            if percent is not None:
+                fraction = percent / 100.0
+        if fraction is not None:
+            if fraction <= 0:
+                close_quantity = 0.0
+            else:
+                close_quantity = original_quantity * min(fraction, 1.0)
+
+    if close_quantity is None:
+        close_quantity = original_quantity
+
+    EPS = 1e-8
+    if close_quantity <= EPS:
+        logging.warning("%s: Requested close size %.8f too small; skipping.", coin, close_quantity)
+        return
+
+    if close_quantity > original_quantity:
+        close_quantity = original_quantity
+
+    remaining_quantity = original_quantity - close_quantity
+    if remaining_quantity <= EPS:
+        close_quantity = original_quantity
+        remaining_quantity = 0.0
+        is_partial = False
+    else:
+        is_partial = True
+
+    raw_reason = str(decision.get("justification", "")).strip()
+    reason_text = raw_reason or pos.get("last_justification") or "AI close signal"
     reason_text = " ".join(reason_text.split())
     reason_text_for_signal = escape_markdown(reason_text)
-    
-    pnl = calculate_unrealized_pnl(coin, current_price)
-    
-    fee_rate = pos.get('fee_rate', TAKER_FEE_RATE)
-    exit_fee = pos['quantity'] * current_price * fee_rate
-    total_fees = pos.get('fees_paid', 0.0) + exit_fee
-    net_pnl = pnl - total_fees
+
+    side = str(pos.get("side", "long")).lower()
+    entry_price = float(pos.get("entry_price", 0.0))
+    leverage_value = pos.get("leverage", 1)
+
+    if side == "long":
+        gross_pnl = (current_price - entry_price) * close_quantity
+    else:
+        gross_pnl = (entry_price - current_price) * close_quantity
+
+    fee_rate_raw = pos.get("fee_rate", TAKER_FEE_RATE)
+    fee_rate = _to_float(fee_rate_raw)
+    if fee_rate is None or fee_rate < 0:
+        fee_rate = TAKER_FEE_RATE
+
+    exit_fee = close_quantity * current_price * fee_rate
+
+    fees_paid_total = float(pos.get("fees_paid", 0.0))
+    entry_fee_share = fees_paid_total * (close_quantity / original_quantity)
+    total_fees = entry_fee_share + exit_fee
+    net_pnl = gross_pnl - total_fees
+
+    margin_total = float(pos.get("margin", 0.0))
+    margin_released = margin_total * (close_quantity / original_quantity)
+    remaining_margin = max(margin_total - margin_released, 0.0)
 
     live_close_receipt = None
     if hyperliquid_trader.is_live:
         live_close_receipt = hyperliquid_trader.close_position(
             coin=coin,
-            side=pos['side'],
-            size=pos['quantity'],
+            side=pos["side"],
+            size=close_quantity,
             fallback_price=current_price,
         )
         if not live_close_receipt.get("success"):
@@ -2131,27 +2386,40 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
                 live_close_receipt.get("close_result"),
             )
             return
-    
-    # Return margin and add net PnL (after fees)
-    balance += pos['margin'] + net_pnl
-    
+
+    # Return proportional margin and realized PnL
+    balance += margin_released + net_pnl
+
+    label = "[PARTIAL CLOSE]" if is_partial else "[CLOSE]"
     color = Fore.GREEN if net_pnl >= 0 else Fore.RED
-    line = f"{color}[CLOSE] {coin} {pos['side'].upper()} {pos['quantity']:.4f} @ ${current_price:.4f}"
+    line = f"{color}{label} {coin} {pos['side'].upper()} {close_quantity:.4f} @ ${current_price:.4f}"
     print(line)
     record_iteration_message(line)
-    line = f"  ├─ Entry: ${pos['entry_price']:.4f} | Gross PnL: ${pnl:.2f}"
+
+    line = f"  ├─ Entry: ${entry_price:.4f} | Gross PnL: ${gross_pnl:.2f}"
     print(line)
     record_iteration_message(line)
+
     if total_fees > 0:
-        line = f"  ├─ Fees Paid: ${total_fees:.2f} (includes exit fee ${exit_fee:.2f})"
+        line = (
+            f"  ├─ Fees This Exit: ${total_fees:.2f} "
+            f"(entry share ${entry_fee_share:.2f}, exit ${exit_fee:.2f})"
+        )
         print(line)
         record_iteration_message(line)
+
+    if is_partial:
+        line = f"  ├─ Remaining: {remaining_quantity:.4f} {coin} | Margin: ${remaining_margin:.2f}"
+        print(line)
+        record_iteration_message(line)
+
     if hyperliquid_trader.is_live and live_close_receipt:
         close_oid = live_close_receipt.get("close_oid")
         if close_oid is not None:
             line = f"  ├─ Hyperliquid Close OID: {close_oid}"
             print(line)
             record_iteration_message(line)
+
     line = f"  ├─ Net PnL: ${net_pnl:.2f}"
     print(line)
     record_iteration_message(line)
@@ -2161,73 +2429,112 @@ def execute_close(coin: str, decision: Dict[str, Any], current_price: float) -> 
     line = f"  └─ Balance: ${balance:.2f}"
     print(line)
     record_iteration_message(line)
-    
-    log_trade(coin, 'CLOSE', {
-        'side': pos['side'],
-        'quantity': pos['quantity'],
-        'price': current_price,
-        'profit_target': 0,
-        'stop_loss': 0,
-        'leverage': pos['leverage'],
-        'confidence': 0,
-        'pnl': net_pnl,
-        'reason': (
-            f"{reason_text} | "
-            f"Gross: ${pnl:.2f} | Fees: ${total_fees:.2f}"
+
+    # Build Telegram message
+    result_emoji = "➖"
+    result_label = "BREAKEVEN"
+    if net_pnl > 0:
+        result_emoji = "✅"
+        result_label = "PROFIT"
+    elif net_pnl < 0:
+        result_emoji = "❌"
+        result_label = "LOSS"
+
+    header = (
+        f"{result_emoji} *PARTIAL CLOSE SIGNAL - {result_label}* {result_emoji}"
+        if is_partial
+        else f"{result_emoji} *CLOSE SIGNAL - {result_label}* {result_emoji}"
+    )
+
+    price_change_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price else 0.0
+    price_change_sign = "+" if price_change_pct >= 0 else ""
+
+    roi_pct = (net_pnl / margin_released) * 100 if margin_released else 0.0
+    roi_sign = "+" if roi_pct >= 0 else ""
+
+    telegram_message = (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"*Asset:* `{coin}`\n"
+        f"*Direction:* {pos['side'].upper()}\n"
+        f"*Closed Size:* `{close_quantity:.4f} {coin}`\n"
+        f"*Entry:* `${entry_price:.4f}`\n"
+        f"*Exit:* `${current_price:.4f}` ({price_change_sign}{price_change_pct:.2f}%)\n"
+        f"\n"
+        f"💰 *P&L Summary*\n"
+        f"• Gross: `${gross_pnl:.2f}`\n"
+        f"• Fees (entry share + exit): `${total_fees:.2f}`\n"
+        f"• *Net:* `{net_pnl:+.2f}`\n"
+        f"• ROI on released margin: `{roi_sign}{roi_pct:.1f}%`\n"
+    )
+    if is_partial:
+        telegram_message += (
+            f"\n"
+            f"📉 *Position Remainder*\n"
+            f"• Remaining Size: `{remaining_quantity:.4f} {coin}`\n"
+            f"• Remaining Margin: `${remaining_margin:.2f}`\n"
         )
-    })
-    
-    del positions[coin]
-    save_state()
-    
-    # Send rich CLOSE signal to the dedicated signals group (if configured).
+    telegram_message += (
+        f"\n"
+        f"💭 *Reasoning*\n"
+        f"_{reason_text_for_signal}_\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {get_current_time().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
     try:
-        # Determine emoji based on profitability
-        if net_pnl > 0:
-            result_emoji = "✅"
-            result_label = "PROFIT"
-        elif net_pnl < 0:
-            result_emoji = "❌"
-            result_label = "LOSS"
-        else:
-            result_emoji = "➖"
-            result_label = "BREAKEVEN"
-        
-        # Calculate price change percentage
-        price_change_pct = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
-        price_change_sign = "+" if price_change_pct >= 0 else ""
-        
-        # Calculate ROI on margin
-        roi_pct = (net_pnl / pos['margin']) * 100 if pos['margin'] > 0 else 0
-        roi_sign = "+" if roi_pct >= 0 else ""
-        
-        close_signal = (
-            f"{result_emoji} *CLOSE SIGNAL - {result_label}* {result_emoji}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"*Asset:* `{coin}`\n"
-            f"*Direction:* {pos['side'].upper()}\n"
-            f"*Size:* `{pos['quantity']:.4f} {coin}`\n"
-            f"\n"
-            f"💰 *P&L Summary*\n"
-            f"• Entry: `${pos['entry_price']:.4f}`\n"
-            f"• Exit: `${current_price:.4f}` ({price_change_sign}{price_change_pct:.2f}%)\n"
-            f"• Gross P&L: `${pnl:.2f}`\n"
-            f"• Fees Paid: `${total_fees:.2f}`\n"
-            f"• *Net P&L:* `${net_pnl:.2f}`\n"
-            f"• ROI: `{roi_sign}{roi_pct:.1f}%`\n"
-            f"\n"
-            f"📈 *Updated Balance*\n"
-            f"• New Balance: `${balance:.2f}`\n"
-            f"\n"
-            f"💭 *Exit Reasoning*\n"
-            f"_{reason_text_for_signal}_\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {get_current_time().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        send_telegram_message(
+            telegram_message,
+            chat_id=TELEGRAM_SIGNALS_CHAT_ID,
+            parse_mode="Markdown",
         )
-        send_telegram_message(close_signal, chat_id=TELEGRAM_SIGNALS_CHAT_ID, parse_mode="Markdown")
     except Exception as exc:
         logging.debug("Failed to send CLOSE signal to Telegram (non-fatal): %s", exc)
 
+    action_name = "CLOSE_PARTIAL" if is_partial else "CLOSE"
+    log_reason = (
+        f"{reason_text} | {pos.get('trade_type', 'TYPE A')} {pos.get('trail_phase', '')} | "
+        f"Closed {close_quantity:.4f}, Remaining {remaining_quantity:.4f} | "
+        f"Gross: ${gross_pnl:.2f} | Fees: ${total_fees:.2f}"
+    )
+
+    log_trade(
+        coin,
+        action_name,
+        {
+            "side": pos["side"],
+            "quantity": close_quantity,
+            "price": current_price,
+            "profit_target": 0,
+            "stop_loss": 0,
+            "leverage": leverage_value,
+            "confidence": 0,
+            "pnl": net_pnl,
+            "reason": log_reason,
+        },
+    )
+
+    if is_partial:
+        pos["quantity"] = remaining_quantity
+        pos["margin"] = remaining_margin
+        pos["fees_paid"] = max(fees_paid_total - entry_fee_share, 0.0)
+        initial_risk_per_unit = _to_float(pos.get("initial_risk_per_unit")) or 0.0
+        pos["initial_risk_usd"] = initial_risk_per_unit * remaining_quantity
+
+        current_stop = _to_float(pos.get("stop_loss"))
+        if current_stop is None:
+            current_stop = entry_price
+        if side == "long":
+            per_unit_risk = max(entry_price - current_stop, 0.0)
+        else:
+            per_unit_risk = max(current_stop - entry_price, 0.0)
+        pos["risk_usd"] = per_unit_risk * remaining_quantity
+
+        pos["last_justification"] = reason_text
+        save_state()
+    else:
+        del positions[coin]
+        save_state()
 
 def process_ai_decisions(decisions: Dict[str, Any]) -> None:
     """Handle AI decisions for each tracked coin."""
@@ -2264,6 +2571,8 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             if coin not in positions:
                 continue
             pos = positions[coin]
+            state_changed = False
+            hold_updates: List[str] = []
             raw_reason = str(decision.get("justification", "")).strip()
             if raw_reason:
                 reason_text = " ".join(raw_reason.split())
@@ -2303,6 +2612,98 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             except (TypeError, ValueError):
                 risk_value = 0.0
 
+            # Optional updates from AI for trailing / targets / trade type
+            def _coerce_float(value: Any) -> Optional[float]:
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            new_stop_candidate = _coerce_float(decision.get("stop_loss"))
+            new_target_candidate = _coerce_float(decision.get("profit_target"))
+            new_phase_raw = str(decision.get("phase", "")).strip()
+            new_trade_type_raw = str(decision.get("trade_type", "")).strip().upper()
+            timestamp_iso = get_current_time().isoformat()
+
+            initial_stop = pos.get("initial_stop", stop_price)
+            try:
+                initial_stop = float(initial_stop)
+            except (TypeError, ValueError):
+                initial_stop = stop_price
+            pos["initial_stop"] = initial_stop
+
+            initial_risk_per_unit = pos.get("initial_risk_per_unit")
+            try:
+                initial_risk_per_unit = float(initial_risk_per_unit)
+            except (TypeError, ValueError):
+                initial_risk_per_unit = None
+            if not initial_risk_per_unit or initial_risk_per_unit == 0:
+                initial_risk_per_unit = abs(entry_price - initial_stop)
+                pos["initial_risk_per_unit"] = initial_risk_per_unit
+
+            if new_stop_candidate is not None and new_stop_candidate > 0:
+                can_update = False
+                if pos["side"] == "long":
+                    if new_stop_candidate >= stop_price - 1e-6 and new_stop_candidate <= current_price:
+                        if new_stop_candidate > stop_price + 1e-6:
+                            can_update = True
+                    else:
+                        logging.debug(
+                            "%s: Ignoring stop update %.6f (long) because it would reduce protection or exceed price.",
+                            coin,
+                            new_stop_candidate,
+                        )
+                else:
+                    if new_stop_candidate <= stop_price + 1e-6 and new_stop_candidate >= current_price:
+                        if new_stop_candidate < stop_price - 1e-6:
+                            can_update = True
+                    else:
+                        logging.debug(
+                            "%s: Ignoring stop update %.6f (short) because it would reduce protection or exceed price.",
+                            coin,
+                            new_stop_candidate,
+                        )
+                if can_update:
+                    pos["stop_loss"] = new_stop_candidate
+                    stop_price = new_stop_candidate
+                    state_changed = True
+                    phase_value = new_phase_raw or pos.get("trail_phase", "Phase 1")
+                    pos["trail_phase"] = phase_value
+                    pos.setdefault("trail_history", []).append(
+                        {
+                            "timestamp": timestamp_iso,
+                            "phase": phase_value,
+                            "stop_loss": new_stop_candidate,
+                            "reason": decision.get("trail_reason", "") or reason_text,
+                        }
+                    )
+                    hold_updates.append(
+                        f"  ├─ Stop adjusted to ${new_stop_candidate:.4f} ({phase_value})"
+                    )
+            if new_target_candidate is not None and new_target_candidate > 0:
+                if pos["side"] == "long" and new_target_candidate >= current_price:
+                    if abs(new_target_candidate - target_price) > 1e-6:
+                        pos["profit_target"] = new_target_candidate
+                        target_price = new_target_candidate
+                        state_changed = True
+                        hold_updates.append(
+                            f"  ├─ Target updated to ${new_target_candidate:.4f}"
+                        )
+                elif pos["side"] == "short" and new_target_candidate <= current_price:
+                    if abs(new_target_candidate - target_price) > 1e-6:
+                        pos["profit_target"] = new_target_candidate
+                        target_price = new_target_candidate
+                        state_changed = True
+                        hold_updates.append(
+                            f"  ├─ Target updated to ${new_target_candidate:.4f}"
+                        )
+            if new_trade_type_raw:
+                pos["trade_type"] = new_trade_type_raw
+            if new_phase_raw:
+                pos["trail_phase"] = new_phase_raw
+
             gross_unrealized = calculate_unrealized_pnl(coin, current_price)
             estimated_exit_fee_now = estimate_exit_fee(pos, current_price)
             total_fees_now = fees_paid + estimated_exit_fee_now
@@ -2324,6 +2725,15 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             else:
                 rr_display = "n/a"
 
+            initial_risk_per_unit = float(pos.get("initial_risk_per_unit") or 0.0)
+            if initial_risk_per_unit:
+                if pos["side"] == "long":
+                    r_multiple = (current_price - entry_price) / initial_risk_per_unit
+                else:
+                    r_multiple = (entry_price - current_price) / initial_risk_per_unit
+            else:
+                r_multiple = 0.0
+
             pnl_color = Fore.GREEN if net_unrealized >= 0 else Fore.RED
             gross_color = Fore.GREEN if gross_unrealized >= 0 else Fore.RED
             net_display = f"{net_unrealized:+.2f}"
@@ -2336,10 +2746,13 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             line = f"{Fore.BLUE}[HOLD] {coin} {pos['side'].upper()} {leverage_display}"
             print(line)
             record_iteration_message(line)
-            line = f"  ├─ Size: {quantity:.4f} {coin} | Margin: ${margin_value:.2f}"
+            line = (
+                f"  ├─ Size: {quantity:.4f} {coin} | Margin: ${margin_value:.2f} | "
+                f"{pos.get('trade_type', 'TYPE A')} {pos.get('trail_phase', 'Phase 1')}"
+            )
             print(line)
             record_iteration_message(line)
-            line = f"  ├─ TP: ${target_price:.4f} | SL: ${stop_price:.4f}"
+            line = f"  ├─ TP: ${target_price:.4f} | SL: ${stop_price:.4f} | Risk ${risk_value:.2f}"
             print(line)
             record_iteration_message(line)
             line = (
@@ -2363,9 +2776,18 @@ def process_ai_decisions(decisions: Dict[str, Any]) -> None:
             line = f"  ├─ Reward/Risk: {rr_display}"
             print(line)
             record_iteration_message(line)
+            line = f"  ├─ R Multiple: {r_multiple:.2f}R"
+            print(line)
+            record_iteration_message(line)
+            if hold_updates:
+                for update_line in hold_updates:
+                    print(update_line)
+                    record_iteration_message(update_line)
             line = f"  └─ Reason: {reason_text}"
             print(line)
             record_iteration_message(line)
+            if state_changed:
+                save_state()
 
 def check_stop_loss_take_profit() -> None:
     """Check and execute stop loss / take profit for all positions using intrabar extremes."""

@@ -6,19 +6,50 @@ The app persists its runtime data (portfolio state, AI messages, and trade histo
 
 ---
 
+## ⚡️ New Enhancements (Main Branch)
+
+Major updates have landed in `main`:
+
+- **Hyperliquid Mainnet Support (Beta)**: Fully functional live execution engine. You can now trade real capital on Hyperliquid with IOC orders, automatic leverage handling, and reduce-only exits.
+- **Interactive Trade Replay**: Generate a standalone `index.html` animation of your backtest or live session (see `replay/` folder). Watch the equity curve evolve bar-by-bar.
+- **Unified Engine**: Backtesting and live trading now use the exact same logic path—reducing the "reality gap" between simulation and production.
+- **Static Multicoin Support**: The bot now monitors multiple coins simultaneously (configured in `bot.py`) and manages independent positions for each.
+
+## 💎 Patron-Only Features
+
+Some advanced capabilities are currently available only to supporters:
+
+- **Dynamic Multicoin Selection**: Instead of a fixed list, the AI dynamically selects the most promising assets to trade based on volatility and volume.
+- **"Sniper" Strategy & Optimized Prompts**: The high-performance prompts that achieved the +17% results mentioned in recent articles.
+- **Advanced Backtesting**: Deeper datasets, "Alpha Arena" stress tests, and more granular performance analytics.
+
+[Become a Patron](https://www.patreon.com/llmtrader) to access these advanced tools and support further development.
+
+---
+
+## 📢 Call for Live Testers
+
+**We are looking for brave souls!**
+
+The Hyperliquid integration is code-complete but needs battle-testing. If you are willing to run this bot with **real money** (small amounts recommended!) and report your results, please get in touch. We need logs, feedback on execution speeds, and slippage reports.
+
+*Risk Warning: This is beta software. Bugs could drain your wallet. Use only money you can burn.*
+
+---
+
 ## 🚀 Development Roadmap
 
-**Support next-gen features through community sponsorship!** Each tier unlocks focused capabilities. Tiers must be funded in order.
+**Support next-gen features through community sponsorship!** Each tier unlocks focused capabilities.
 
 | Tier | Feature | Progress |
 |------|---------|----------|
-| 🔒 **Tier 1** | Hyperliquid Live Execution | **$0 / $1,000** |
+| ✅ **Tier 1** | Hyperliquid Live Execution | **COMPLETED (Self-funded)** |
 | 🔒 **Tier 2** | Emergency Controls & Monitoring | **$0 / $1,000** |
 | 🔒 **Tier 3** | Smart Position Sizing | **$0 / $1,000** |
 | 🔒 **Tier 4** | Portfolio Risk Limits | **$0 / $1,000** |
 | 🔒 **Tier 5** | Multi-LLM Support | **$0 / $1,000** |
 | 🔒 **Tier 6** | Strategy Voting System | **$0 / $1,000** |
-| 🔒 **Tier 7** | Basic Backtesting | **$0 / $1,000** |
+| ✅ **Tier 7** | Basic Backtesting | **COMPLETED (Self-funded)** |
 | 🔒 **Tier 8** | Advanced Backtesting | **$0 / $1,000** |
 | 🔒 **Tier 9** | Performance Analytics | **$0 / $1,000** |
 | 🔒 **Tier 10** | Smart Alerting & Reports | **$0 / $1,000** |
@@ -269,10 +300,12 @@ This project evolves through community sponsorship. Each **$1,000 tier** unlocks
 
 ### Current Status
 
-**🔒 Tier 1 is next** - Hyperliquid Live Execution needs funding to begin development.
+**✅ Tier 1 (Live Execution) & Tier 7 (Basic Backtesting) are live!**
+
+**🔒 Tier 2 is next** - Emergency Controls & Monitoring needs funding to begin development.
 
 ### 🎯 Tier 1: Hyperliquid Live Execution
-**Goal: $1,000 | Funded: $0**
+**Status: ✅ COMPLETED (Self-funded)**
 
 Core live trading on Hyperliquid mainnet:
 - IOC order execution with retry logic
@@ -322,7 +355,7 @@ Run multiple strategies:
 - Individual strategy P&L tracking
 
 ### 📈 Tier 7: Basic Backtesting
-**Goal: $1,000 | Funded: $0**
+**Status: ✅ COMPLETED (Self-funded)**
 
 Test on historical data:
 - Historical OHLCV data pipeline
@@ -359,7 +392,7 @@ Intelligence layer:
 
 ### 💰 How to Sponsor
 
-1. **Choose Tier 1** (must fund in order)
+1. **Choose Tier 2**
 2. **Send $1,000** to: `0x4B1bEd654BA86F64441037ad0A7D2ce54321B381` (Ethereum)
 3. **Create Issue** with transaction ID
 4. **Track Progress** - Development starts once funded

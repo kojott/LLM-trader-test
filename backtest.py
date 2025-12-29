@@ -371,10 +371,17 @@ def summarize_trades(trades_path: Path) -> Dict[str, Optional[float]]:
     empty_stats = {
         "total_trades": 0,
         "closed_trades": 0,
+        "partial_closes": 0,
+        "close_events": 0,
         "winning_trades": 0,
         "losing_trades": 0,
+        "breakeven_trades": 0,
         "win_rate_pct": None,
         "net_realized_pnl": 0.0,
+        "avg_win_pnl": None,
+        "avg_loss_pnl": None,
+        "profit_factor": None,
+        "avg_trade_pnl": None,
     }
 
     if not trades_path.exists():
@@ -392,32 +399,55 @@ def summarize_trades(trades_path: Path) -> Dict[str, Optional[float]]:
     actions = df["action"].astype(str).str.upper().str.strip()
     entries_mask = actions == "ENTRY"
     closes_mask = actions == "CLOSE"
+    partial_mask = actions == "CLOSE_PARTIAL"
+    close_events_mask = closes_mask | partial_mask
 
     total_trades = int(entries_mask.sum())
+    full_closes = int(closes_mask.sum())
+    partial_closes = int(partial_mask.sum())
 
-    close_trades = df.loc[closes_mask].copy()
+    close_trades = df.loc[close_events_mask].copy()
     if close_trades.empty:
         return {
             **empty_stats,
             "total_trades": total_trades,
+            "closed_trades": full_closes,
+            "partial_closes": partial_closes,
         }
 
     close_trades["pnl"] = pd.to_numeric(close_trades["pnl"], errors="coerce")
     close_trades = close_trades[np.isfinite(close_trades["pnl"])]
 
-    closed = int(len(close_trades))
+    close_events = int(len(close_trades))
     winning = int((close_trades["pnl"] > 0).sum())
     losing = int((close_trades["pnl"] < 0).sum())
-    win_rate = (winning / closed) * 100 if closed else None
-    net_realized = float(close_trades["pnl"].sum()) if closed else 0.0
+    breakeven = int((close_trades["pnl"] == 0).sum())
+    win_rate = (winning / close_events) * 100 if close_events else None
+    net_realized = float(close_trades["pnl"].sum()) if close_events else 0.0
+    avg_trade = net_realized / close_events if close_events else None
+
+    wins = close_trades[close_trades["pnl"] > 0]["pnl"]
+    losses = close_trades[close_trades["pnl"] < 0]["pnl"]
+    avg_win = float(wins.mean()) if not wins.empty else None
+    avg_loss = float(losses.mean()) if not losses.empty else None
+    gross_profit = float(wins.sum()) if not wins.empty else 0.0
+    gross_loss = float(-losses.sum()) if not losses.empty else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
 
     return {
         "total_trades": total_trades,
-        "closed_trades": closed,
+        "closed_trades": full_closes,
+        "partial_closes": partial_closes,
+        "close_events": close_events,
         "winning_trades": winning,
         "losing_trades": losing,
+        "breakeven_trades": breakeven,
         "win_rate_pct": float(win_rate) if win_rate is not None else None,
         "net_realized_pnl": net_realized,
+        "avg_win_pnl": avg_win,
+        "avg_loss_pnl": avg_loss,
+        "profit_factor": profit_factor,
+        "avg_trade_pnl": avg_trade,
     }
 
 
