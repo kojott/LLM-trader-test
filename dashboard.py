@@ -339,7 +339,11 @@ def render_portfolio_tab(state_df: pd.DataFrame, trades_df: pd.DataFrame) -> Non
     )
 
     st.subheader("Equity Over Time (with BTC benchmark)")
-    base_investment = 10_000.0
+    # Get initial equity from portfolio state for BTC benchmark calculation
+    initial_equity_series = state_df["total_equity"].dropna()
+    base_investment = 10_000.0  # Default fallback
+    if not initial_equity_series.empty:
+        base_investment = float(initial_equity_series.iloc[0])
 
     chart_frames = [
         pd.DataFrame(
